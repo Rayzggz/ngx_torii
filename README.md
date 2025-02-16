@@ -2,7 +2,7 @@
 
 ## Overview
 
-This module is a modified version of the `ngx_http_auth_request_module` to be compatible with the server_torii backend service.
+This module is a modified version of the `ngx_http_auth_request_module` to serve as the Nginx connector for [server_torii](https://github.com/Rayzggz/server_torii).
 
 
 ## Directives
