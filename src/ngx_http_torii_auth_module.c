@@ -5,6 +5,9 @@
 static ngx_table_elt_t *ngx_http_torii_auth_request_clone_header(ngx_http_request_t *r,
                                                                 ngx_list_t *list,
                                                                 ngx_table_elt_t *src);
+static ngx_int_t ngx_http_torii_auth_request_prepare_header_arrays(ngx_http_request_t *r,
+                                                                   ngx_http_headers_out_t *dst,
+                                                                   ngx_http_headers_out_t *src);
 static void ngx_http_torii_auth_request_map_header_ptrs(ngx_http_headers_out_t *dst,
                                                         ngx_http_headers_out_t *src,
                                                         ngx_table_elt_t *src_header,
@@ -271,6 +274,10 @@ ngx_http_torii_auth_request_copy_response(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    if (ngx_http_torii_auth_request_prepare_header_arrays(r, dst, src) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
     dst->server = NULL;
     dst->date = NULL;
     dst->content_length = NULL;
@@ -284,14 +291,6 @@ ngx_http_torii_auth_request_copy_response(ngx_http_request_t *r,
     dst->expires = NULL;
     dst->etag = NULL;
     dst->override_charset = NULL;
-    dst->cache_control.nelts = 0;
-    dst->cache_control.elts = NULL;
-    dst->cache_control.size = 0;
-    dst->cache_control.nalloc = 0;
-    dst->link.nelts = 0;
-    dst->link.elts = NULL;
-    dst->link.size = 0;
-    dst->link.nalloc = 0;
 
     dst->status = ctx->status ? ctx->status : src->status;
     if (ngx_http_torii_auth_request_copy_str(r->pool, &dst->status_line,
@@ -432,12 +431,61 @@ ngx_http_torii_auth_request_clone_header(ngx_http_request_t *r,
 }
 
 
+static ngx_int_t
+ngx_http_torii_auth_request_prepare_header_arrays(ngx_http_request_t *r,
+                                                  ngx_http_headers_out_t *dst,
+                                                  ngx_http_headers_out_t *src)
+{
+    ngx_table_elt_t  **elts;
+
+    if (src->cache_control != NULL && src->cache_control->nelts != 0) {
+        dst->cache_control = ngx_array_create(r->pool, src->cache_control->nelts,
+                                              sizeof(ngx_table_elt_t *));
+        if (dst->cache_control == NULL) {
+            return NGX_ERROR;
+        }
+
+        elts = ngx_array_push_n(dst->cache_control, src->cache_control->nelts);
+        if (elts == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memzero(elts, src->cache_control->nelts * sizeof(ngx_table_elt_t *));
+    } else {
+        dst->cache_control = NULL;
+    }
+
+    if (src->link != NULL && src->link->nelts != 0) {
+        dst->link = ngx_array_create(r->pool, src->link->nelts,
+                                     sizeof(ngx_table_elt_t *));
+        if (dst->link == NULL) {
+            return NGX_ERROR;
+        }
+
+        elts = ngx_array_push_n(dst->link, src->link->nelts);
+        if (elts == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memzero(elts, src->link->nelts * sizeof(ngx_table_elt_t *));
+    } else {
+        dst->link = NULL;
+    }
+
+    return NGX_OK;
+}
+
+
 static void
 ngx_http_torii_auth_request_map_header_ptrs(ngx_http_headers_out_t *dst,
                                             ngx_http_headers_out_t *src,
                                             ngx_table_elt_t *src_header,
                                             ngx_table_elt_t *dst_header)
 {
+    ngx_table_elt_t  **src_elts;
+    ngx_table_elt_t  **dst_elts;
+    ngx_uint_t         i;
+
     if (src->server == src_header) {
         dst->server = dst_header;
     }
@@ -484,6 +532,28 @@ ngx_http_torii_auth_request_map_header_ptrs(ngx_http_headers_out_t *dst,
 
     if (src->etag == src_header) {
         dst->etag = dst_header;
+    }
+
+    if (src->cache_control && dst->cache_control) {
+        src_elts = src->cache_control->elts;
+        dst_elts = dst->cache_control->elts;
+
+        for (i = 0; i < src->cache_control->nelts; i++) {
+            if (src_elts[i] == src_header) {
+                dst_elts[i] = dst_header;
+            }
+        }
+    }
+
+    if (src->link && dst->link) {
+        src_elts = src->link->elts;
+        dst_elts = dst->link->elts;
+
+        for (i = 0; i < src->link->nelts; i++) {
+            if (src_elts[i] == src_header) {
+                dst_elts[i] = dst_header;
+            }
+        }
     }
 }
 
