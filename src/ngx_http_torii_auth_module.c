@@ -148,12 +148,24 @@ ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
                 }
             }
 
-            if (r->headers_out.content_length_n == -1) {
+            if (body_len >= 0) {
                 r->headers_out.content_length_n = body_len;
+
+                if (r->headers_out.content_length != NULL) {
+                    u_char  *data;
+
+                    data = ngx_pnalloc(r->pool, NGX_OFF_T_LEN);
+                    if (data == NULL) {
+                        return NGX_ERROR;
+                    }
+
+                    r->headers_out.content_length->value.len = ngx_sprintf(data, "%O", body_len) - data;
+                    r->headers_out.content_length->value.data = data;
+                }
             }
 
             rc = ngx_http_send_header(r);
-            if (rc == NGX_ERROR) {
+            if (rc == NGX_ERROR || rc > NGX_OK) {
                 return rc;
             }
 
