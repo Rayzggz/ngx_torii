@@ -9,6 +9,10 @@ static void ngx_http_torii_auth_request_map_header_ptrs(ngx_http_headers_out_t *
                                                         ngx_http_headers_out_t *src,
                                                         ngx_table_elt_t *src_header,
                                                         ngx_table_elt_t *dst_header);
+static ngx_int_t ngx_http_torii_auth_request_clone_chain(ngx_http_request_t *r,
+                                                         ngx_chain_t *src,
+                                                         ngx_chain_t **dst,
+                                                         off_t *size);
 static ngx_int_t ngx_http_torii_auth_request_copy_str(ngx_pool_t *pool,
                                                       ngx_str_t *dst,
                                                       ngx_str_t *src);
@@ -103,11 +107,49 @@ ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
         }
 
         {
-            ngx_int_t  rc;
-            ngx_chain_t *out;
+            ngx_int_t    rc;
+            ngx_chain_t *out, *src_out;
+            off_t        body_len;
 
             if (ngx_http_torii_auth_request_copy_response(r, sr, ctx) != NGX_OK) {
                 return NGX_ERROR;
+            }
+
+            src_out = sr->out;
+            if (src_out == NULL && sr->upstream) {
+                src_out = sr->upstream->out_bufs;
+            }
+
+            body_len = 0;
+            out = NULL;
+
+            if (src_out != NULL) {
+                if (ngx_http_torii_auth_request_clone_chain(r, src_out, &out, &body_len) != NGX_OK) {
+                    return NGX_ERROR;
+                }
+            } else if (sr->upstream) {
+                ngx_chain_t  temp_chain;
+                ngx_buf_t    temp_buf;
+
+                temp_buf = sr->upstream->buffer;
+
+                if (temp_buf.pos != NULL && temp_buf.last != NULL && temp_buf.last > temp_buf.pos) {
+                    temp_buf.last_buf = 1;
+                    temp_buf.last_in_chain = 1;
+                    temp_buf.temporary = 1;
+                    temp_buf.memory = 1;
+
+                    temp_chain.buf = &temp_buf;
+                    temp_chain.next = NULL;
+
+                    if (ngx_http_torii_auth_request_clone_chain(r, &temp_chain, &out, &body_len) != NGX_OK) {
+                        return NGX_ERROR;
+                    }
+                }
+            }
+
+            if (r->headers_out.content_length_n == -1) {
+                r->headers_out.content_length_n = body_len;
             }
 
             rc = ngx_http_send_header(r);
@@ -120,9 +162,9 @@ ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
                 return NGX_DONE;
             }
 
-            out = sr->out;
-            if (out == NULL && sr->upstream) {
-                out = sr->upstream->out_bufs;
+            if (out == NULL) {
+                ngx_http_finalize_request(r, NGX_OK);
+                return NGX_DONE;
             }
 
             rc = ngx_http_output_filter(r, out);
@@ -418,6 +460,89 @@ ngx_http_torii_auth_request_clone_header(ngx_http_request_t *r,
     }
 
     return dst;
+}
+
+
+static ngx_int_t
+ngx_http_torii_auth_request_clone_chain(ngx_http_request_t *r,
+                                        ngx_chain_t *src,
+                                        ngx_chain_t **dst,
+                                        off_t *size)
+{
+    ngx_chain_t  **next;
+
+    *dst = NULL;
+    next = dst;
+
+    for ( ; src; src = src->next) {
+        ngx_chain_t  *cl;
+        ngx_buf_t    *s;
+        ngx_buf_t    *d;
+        size_t        len;
+        u_char       *data;
+
+        s = src->buf;
+
+        if (!ngx_buf_in_memory(s)) {
+            if (!ngx_buf_special(s)) {
+                return NGX_ERROR;
+            }
+
+            len = 0;
+        } else {
+            len = ngx_buf_size(s);
+        }
+
+        if (len == 0 && !ngx_buf_special(s) && !s->last_buf
+            && !s->last_in_chain && !s->flush)
+        {
+            continue;
+        }
+
+        cl = ngx_alloc_chain_link(r->pool);
+        if (cl == NULL) {
+            return NGX_ERROR;
+        }
+
+        cl->buf = ngx_calloc_buf(r->pool);
+        if (cl->buf == NULL) {
+            return NGX_ERROR;
+        }
+
+        d = cl->buf;
+
+        if (len != 0) {
+            data = ngx_pnalloc(r->pool, len);
+            if (data == NULL) {
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(data, s->pos, len);
+
+            d->pos = data;
+            d->last = data + len;
+            d->start = data;
+            d->end = data + len;
+        }
+
+        d->temporary = 1;
+        d->memory = 1;
+        d->flush = s->flush;
+        d->sync = s->sync;
+        d->last_buf = s->last_buf;
+        d->last_in_chain = s->last_in_chain;
+        d->tag = s->tag;
+
+        cl->next = NULL;
+        *next = cl;
+        next = &cl->next;
+
+        if (size != NULL) {
+            *size += (off_t) len;
+        }
+    }
+
+    return NGX_OK;
 }
 
 
