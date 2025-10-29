@@ -2,6 +2,18 @@
 #include <ngx_config.h>
 
 
+static ngx_table_elt_t *ngx_http_torii_auth_request_clone_header(ngx_http_request_t *r,
+                                                                ngx_list_t *list,
+                                                                ngx_table_elt_t *src);
+static void ngx_http_torii_auth_request_map_header_ptrs(ngx_http_headers_out_t *dst,
+                                                        ngx_http_headers_out_t *src,
+                                                        ngx_table_elt_t *src_header,
+                                                        ngx_table_elt_t *dst_header);
+static ngx_int_t ngx_http_torii_auth_request_copy_str(ngx_pool_t *pool,
+                                                      ngx_str_t *dst,
+                                                      ngx_str_t *src);
+
+
 static ngx_command_t  ngx_http_torii_auth_request_commands[] = {
 
         { ngx_string("torii_auth_request"),
@@ -90,43 +102,30 @@ ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
             return NGX_ERROR;
         }
 
-        r->headers_out.status = sr->headers_out.status;
-        r->headers_out.content_length_n = sr->headers_out.content_length_n;
-        r->headers_out.content_type = sr->headers_out.content_type;
-
-
         {
-            ngx_list_part_t  *part = &sr->headers_out.headers.part;
-            ngx_table_elt_t  *h = part->elts;
-            ngx_uint_t        i;
+            ngx_int_t  rc;
+            ngx_chain_t *out;
 
-            for (i = 0; ; i++) {
-                if (i >= part->nelts) {
-                    if (part->next == NULL) {
-                        break;
-                    }
-                    part = part->next;
-                    h = part->elts;
-                    i = 0;
-                }
-                {
-                    ngx_table_elt_t  *ho = ngx_list_push(&r->headers_out.headers);
-                    if (ho == NULL) {
-                        return NGX_ERROR;
-                    }
-                    *ho = h[i];
-                }
+            if (ngx_http_torii_auth_request_copy_response(r, sr, ctx) != NGX_OK) {
+                return NGX_ERROR;
             }
-        }
 
-
-        {
-            ngx_int_t rc;
             rc = ngx_http_send_header(r);
-            if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+            if (rc == NGX_ERROR) {
                 return rc;
             }
-            rc = ngx_http_output_filter(r, sr->out);
+
+            if (r->header_only) {
+                ngx_http_finalize_request(r, NGX_OK);
+                return NGX_DONE;
+            }
+
+            out = sr->out;
+            if (out == NULL && sr->upstream) {
+                out = sr->upstream->out_bufs;
+            }
+
+            rc = ngx_http_output_filter(r, out);
             ngx_http_finalize_request(r, rc);
             return NGX_DONE;
         }
@@ -178,7 +177,13 @@ ngx_http_torii_auth_request_done(ngx_http_request_t *r, void *data, ngx_int_t rc
                    "torii auth request done s:%ui", r->headers_out.status);
 
     ctx->done = 1;
-    ctx->status = r->headers_out.status;
+    if (r->headers_out.status != 0) {
+        ctx->status = r->headers_out.status;
+    } else if (rc > 0) {
+        ctx->status = rc;
+    } else {
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     return NGX_OK;
 }
@@ -240,6 +245,267 @@ ngx_http_torii_auth_request_variable(ngx_http_request_t *r,
                    "torii auth request variable");
 
     v->not_found = 1;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_torii_auth_request_copy_response(ngx_http_request_t *r,
+                                          ngx_http_request_t *sr,
+                                          ngx_http_torii_auth_request_ctx_t *ctx)
+{
+    ngx_list_part_t           *part;
+    ngx_table_elt_t           *header;
+    ngx_http_headers_out_t    *dst;
+    ngx_http_headers_out_t    *src;
+    ngx_uint_t                 i;
+
+    dst = &r->headers_out;
+    src = &sr->headers_out;
+
+    if (ngx_list_init(&dst->headers, r->pool, 20, sizeof(ngx_table_elt_t)) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_list_init(&dst->trailers, r->pool, 4, sizeof(ngx_table_elt_t)) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    dst->server = NULL;
+    dst->date = NULL;
+    dst->content_length = NULL;
+    dst->content_encoding = NULL;
+    dst->location = NULL;
+    dst->refresh = NULL;
+    dst->last_modified = NULL;
+    dst->content_range = NULL;
+    dst->accept_ranges = NULL;
+    dst->www_authenticate = NULL;
+    dst->expires = NULL;
+    dst->etag = NULL;
+    dst->override_charset = NULL;
+    dst->cache_control.nelts = 0;
+    dst->cache_control.elts = NULL;
+    dst->cache_control.size = 0;
+    dst->cache_control.nalloc = 0;
+    dst->link.nelts = 0;
+    dst->link.elts = NULL;
+    dst->link.size = 0;
+    dst->link.nalloc = 0;
+
+    dst->status = ctx->status ? ctx->status : src->status;
+    if (ngx_http_torii_auth_request_copy_str(r->pool, &dst->status_line,
+                                             &src->status_line)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    dst->content_length_n = src->content_length_n;
+    dst->content_offset = src->content_offset;
+    dst->date_time = src->date_time;
+    dst->last_modified_time = src->last_modified_time;
+    if (ngx_http_torii_auth_request_copy_str(r->pool, &dst->content_type,
+                                             &src->content_type)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    dst->content_type_len = src->content_type_len;
+    if (ngx_http_torii_auth_request_copy_str(r->pool, &dst->charset,
+                                             &src->charset)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    dst->content_type_lowcase = NULL;
+    dst->content_type_hash = src->content_type_hash;
+
+    part = &src->headers.part;
+    header = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+
+        if (header[i].hash == 0) {
+            continue;
+        }
+
+        {
+            ngx_table_elt_t  *ho;
+
+            ho = ngx_http_torii_auth_request_clone_header(r, &dst->headers, &header[i]);
+            if (ho == NULL) {
+                return NGX_ERROR;
+            }
+
+            ngx_http_torii_auth_request_map_header_ptrs(dst, src, &header[i], ho);
+        }
+    }
+
+    part = &src->trailers.part;
+    header = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+
+        if (header[i].hash == 0) {
+            continue;
+        }
+
+        if (ngx_http_torii_auth_request_clone_header(r, &dst->trailers, &header[i]) == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t ngx_http_torii_auth_request_copy_str(ngx_pool_t *pool,
+                                                      ngx_str_t *dst,
+                                                      ngx_str_t *src);
+
+
+static ngx_table_elt_t *
+ngx_http_torii_auth_request_clone_header(ngx_http_request_t *r,
+                                         ngx_list_t *list,
+                                         ngx_table_elt_t *src)
+{
+    ngx_table_elt_t  *dst;
+
+    dst = ngx_list_push(list);
+    if (dst == NULL) {
+        return NULL;
+    }
+
+    ngx_memcpy(dst, src, sizeof(ngx_table_elt_t));
+    dst->next = NULL;
+
+    if (src->key.len) {
+        dst->key.data = ngx_pnalloc(r->pool, src->key.len);
+        if (dst->key.data == NULL) {
+            return NULL;
+        }
+        ngx_memcpy(dst->key.data, src->key.data, src->key.len);
+    } else {
+        dst->key.data = NULL;
+    }
+
+    if (src->value.len) {
+        dst->value.data = ngx_pnalloc(r->pool, src->value.len);
+        if (dst->value.data == NULL) {
+            return NULL;
+        }
+        ngx_memcpy(dst->value.data, src->value.data, src->value.len);
+    } else {
+        dst->value.data = NULL;
+    }
+
+    if (src->lowcase_key && src->key.len) {
+        dst->lowcase_key = ngx_pnalloc(r->pool, src->key.len);
+        if (dst->lowcase_key == NULL) {
+            return NULL;
+        }
+        ngx_memcpy(dst->lowcase_key, src->lowcase_key, src->key.len);
+    } else {
+        dst->lowcase_key = NULL;
+    }
+
+    return dst;
+}
+
+
+static void
+ngx_http_torii_auth_request_map_header_ptrs(ngx_http_headers_out_t *dst,
+                                            ngx_http_headers_out_t *src,
+                                            ngx_table_elt_t *src_header,
+                                            ngx_table_elt_t *dst_header)
+{
+    if (src->server == src_header) {
+        dst->server = dst_header;
+    }
+
+    if (src->date == src_header) {
+        dst->date = dst_header;
+    }
+
+    if (src->content_length == src_header) {
+        dst->content_length = dst_header;
+    }
+
+    if (src->content_encoding == src_header) {
+        dst->content_encoding = dst_header;
+    }
+
+    if (src->location == src_header) {
+        dst->location = dst_header;
+    }
+
+    if (src->refresh == src_header) {
+        dst->refresh = dst_header;
+    }
+
+    if (src->last_modified == src_header) {
+        dst->last_modified = dst_header;
+    }
+
+    if (src->content_range == src_header) {
+        dst->content_range = dst_header;
+    }
+
+    if (src->accept_ranges == src_header) {
+        dst->accept_ranges = dst_header;
+    }
+
+    if (src->www_authenticate == src_header) {
+        dst->www_authenticate = dst_header;
+    }
+
+    if (src->expires == src_header) {
+        dst->expires = dst_header;
+    }
+
+    if (src->etag == src_header) {
+        dst->etag = dst_header;
+    }
+}
+
+
+static ngx_int_t
+ngx_http_torii_auth_request_copy_str(ngx_pool_t *pool, ngx_str_t *dst,
+                                     ngx_str_t *src)
+{
+    if (src->len == 0 || src->data == NULL) {
+        dst->len = 0;
+        dst->data = NULL;
+        return NGX_OK;
+    }
+
+    dst->data = ngx_pnalloc(pool, src->len);
+    if (dst->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(dst->data, src->data, src->len);
+    dst->len = src->len;
+
     return NGX_OK;
 }
 

@@ -31,6 +31,9 @@ static ngx_int_t ngx_http_torii_auth_request_set_variables(ngx_http_request_t *r
                                                            ngx_http_torii_auth_request_conf_t *tarf, ngx_http_torii_auth_request_ctx_t *ctx);
 static ngx_int_t ngx_http_torii_auth_request_variable(ngx_http_request_t *r,
                                                       ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_torii_auth_request_copy_response(ngx_http_request_t *r,
+                                                           ngx_http_request_t *sr,
+                                                           ngx_http_torii_auth_request_ctx_t *ctx);
 static void *ngx_http_torii_auth_request_create_conf(ngx_conf_t *cf);
 static char *ngx_http_torii_auth_request_merge_conf(ngx_conf_t *cf,
                                                     void *parent, void *child);
