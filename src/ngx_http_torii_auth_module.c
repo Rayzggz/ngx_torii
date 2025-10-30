@@ -1,11 +1,8 @@
-
+#include "ngx_http_torii_auth_module.h"
 /*
  * Copyright (C) Maxim Dounin
  * Copyright (C) Nginx, Inc.
  */
-
-
-
 
 
 static ngx_command_t  ngx_http_torii_auth_request_commands[] = {
