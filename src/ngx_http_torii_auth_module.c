@@ -59,7 +59,11 @@ ngx_module_t  ngx_http_torii_auth_request_module = {
 static ngx_int_t
 ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
 {
+#if (nginx_version >= 1023000)
     ngx_table_elt_t               *h, *ho, **ph;
+#else
+    ngx_table_elt_t               *h, *ho;
+#endif
     ngx_http_request_t            *sr;
     ngx_http_post_subrequest_t    *ps;
     ngx_http_torii_auth_request_ctx_t   *ctx;
@@ -108,7 +112,7 @@ ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
             if (!h && sr->upstream) {
                 h = sr->upstream->headers_in.www_authenticate;
             }
-
+#if (nginx_version >= 1023000)
             ph = &r->headers_out.www_authenticate;
 
             while (h) {
@@ -125,6 +129,18 @@ ngx_http_torii_auth_request_handler(ngx_http_request_t *r)
 
                 h = h->next;
             }
+#else
+            if (h) {
+                ho = ngx_list_push(&r->headers_out.headers);
+                if (ho == NULL) {
+                    return NGX_ERROR;
+                }
+
+                *ho = *h;
+
+                r->headers_out.www_authenticate = ho;
+            }
+#endif
 
             return ctx->status;
         }
