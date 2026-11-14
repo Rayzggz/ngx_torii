@@ -1,0 +1,43 @@
+# Local IDE settings
+/.idea/
+/.vscode/
+*.iml
+
+# Build directories and compilation database
+/build/
+/cmake-build-*/
+/objs/
+/CMakeUserPresets.json
+/compile_commands.json
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Coverage and profiling output
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# Local test runs (when TMPDIR points into the checkout)
+ngx-torii-t.*/
+*.log
+*.pid
+
+# Editor backups and operating system metadata
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
