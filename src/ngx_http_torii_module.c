@@ -12,6 +12,11 @@
  *   any other value  the request stops here, and the response of the subrequest
  *                    (status, headers and body) is sent to the client;
  *   absent           Torii did not decide; torii_on_error applies.
+ *
+ * When a request has been served, the module tells Torii what became of it in
+ * a request report: one datagram holding one JSON object.  The reports feed
+ * the traffic analysis of Torii, which otherwise sees a request only before
+ * it is served.
  */
 
 
@@ -24,12 +29,33 @@
 #define NGX_HTTP_TORII_ON_ERROR_PASS  1
 
 
+#define NGX_HTTP_TORII_REPORT_URI_MAX      2048
+#define NGX_HTTP_TORII_REPORT_HEADER_MAX   512
+#define NGX_HTTP_TORII_REPORT_SHORT_MAX    128
+
+/* after a failed send, reports are skipped for this long */
+#define NGX_HTTP_TORII_REPORT_RETRY        1000
+
+
+typedef struct {
+    ngx_syslog_peer_t          peer;
+    ngx_msec_t                 retry;
+} ngx_http_torii_log_t;
+
+
+typedef struct {
+    ngx_str_t                  key;
+    ngx_str_t                  value;
+} ngx_http_torii_field_t;
+
+
 typedef struct {
     ngx_flag_t                 enable;
     ngx_str_t                  endpoint;
     ngx_uint_t                 on_error;
     ngx_http_complex_value_t  *site;
     ngx_http_complex_value_t  *features;
+    ngx_http_torii_log_t      *log;
 } ngx_http_torii_loc_conf_t;
 
 
@@ -58,6 +84,15 @@ static ngx_int_t ngx_http_torii_conf_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_torii_result_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_torii_log_handler(ngx_http_request_t *r);
+static u_char *ngx_http_torii_report(ngx_http_request_t *r,
+    ngx_http_torii_loc_conf_t *tlcf, size_t *len);
+static void ngx_http_torii_set_field(ngx_http_torii_field_t *field,
+    char *key, ngx_str_t *value, size_t max);
+static ngx_table_elt_t *ngx_http_torii_request_header(ngx_http_request_t *r,
+    char *name);
+static char *ngx_http_torii_log(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static ngx_int_t ngx_http_torii_add_variables(ngx_conf_t *cf);
 static void *ngx_http_torii_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_torii_merge_loc_conf(ngx_conf_t *cf, void *parent,
@@ -108,6 +143,13 @@ static ngx_command_t  ngx_http_torii_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_torii_loc_conf_t, on_error),
       &ngx_http_torii_on_error },
+
+    { ngx_string("torii_log"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_torii_log,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
 
       ngx_null_command
 };
@@ -505,6 +547,367 @@ ngx_http_torii_find_header(ngx_list_t *headers, ngx_str_t *name)
 }
 
 
+/*
+ * The log phase runs once for every client request, whatever became of it
+ * and whatever access_log says, so this is where the request is reported.
+ */
+
+static ngx_int_t
+ngx_http_torii_log_handler(ngx_http_request_t *r)
+{
+    size_t                      len;
+    u_char                     *report;
+    ssize_t                     n;
+    ngx_http_torii_log_t       *tl;
+    ngx_http_torii_loc_conf_t  *tlcf;
+
+    tlcf = ngx_http_get_module_loc_conf(r, ngx_http_torii_module);
+
+    tl = tlcf->log;
+
+    /*
+     * only requests of a Torii site are reported: a server block that
+     * neither names a site nor checks its requests has nothing to do with
+     * Torii, and its traffic must not end up in the default site
+     */
+
+    if (tl == NULL || (!tlcf->enable && tlcf->site == NULL)) {
+        return NGX_OK;
+    }
+
+    /*
+     * while Torii is away every send fails, for a Unix socket with an alert
+     * in the error log; trying once in a while keeps both the log and the
+     * request path quiet
+     */
+
+    if (tl->peer.busy
+        || (tl->retry && (ngx_msec_int_t) (ngx_current_msec - tl->retry) < 0))
+    {
+        return NGX_OK;
+    }
+
+    report = ngx_http_torii_report(r, tlcf, &len);
+    if (report == NULL) {
+        return NGX_ERROR;
+    }
+
+    n = ngx_syslog_send(&tl->peer, report, len);
+
+    if (n < 0) {
+        /* a full socket buffer or Torii not running: the report is lost */
+
+        if (tl->retry == 0) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "torii: sending a request report failed, "
+                          "reports are skipped until it works again");
+        }
+
+        tl->retry = ngx_current_msec + NGX_HTTP_TORII_REPORT_RETRY;
+
+        if (tl->retry == 0) {
+            tl->retry = 1;
+        }
+
+        return NGX_OK;
+    }
+
+    tl->retry = 0;
+
+    return NGX_OK;
+}
+
+
+/* builds the JSON object of a request report in the pool of the request */
+
+static u_char *
+ngx_http_torii_report(ngx_http_request_t *r, ngx_http_torii_loc_conf_t *tlcf,
+    size_t *len)
+{
+    off_t                       bytes;
+    size_t                      size;
+    u_char                     *buf, *p, *fp;
+    ngx_str_t                   site, fetch, empty;
+    ngx_uint_t                  i, n, status, ustatus;
+    ngx_time_t                 *tp;
+    ngx_msec_int_t              rt, urt;
+    ngx_table_elt_t            *h, *dest, *mode, *fsite;
+    ngx_http_variable_value_t  *vv;
+    ngx_http_upstream_state_t  *state;
+    ngx_http_torii_field_t      fields[12];
+
+    static ngx_str_t  cache_name = ngx_string("upstream_cache_status");
+
+    ngx_str_null(&empty);
+    ngx_memzero(fields, sizeof(fields));
+    n = 0;
+
+    ngx_str_null(&site);
+
+    if (tlcf->site
+        && ngx_http_complex_value(r, tlcf->site, &site) != NGX_OK)
+    {
+        return NULL;
+    }
+
+    ngx_http_torii_set_field(&fields[n++], "site", &site,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+    ngx_http_torii_set_field(&fields[n++], "ip", &r->connection->addr_text,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+    ngx_http_torii_set_field(&fields[n++], "host", &r->headers_in.server,
+                             NGX_HTTP_TORII_REPORT_HEADER_MAX);
+    ngx_http_torii_set_field(&fields[n++], "method", &r->method_name,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+    ngx_http_torii_set_field(&fields[n++], "uri", &r->unparsed_uri,
+                             NGX_HTTP_TORII_REPORT_URI_MAX);
+
+    vv = &r->variables[ngx_http_torii_decision_index];
+    if (vv->valid && !vv->not_found) {
+        fields[n].value.data = vv->data;
+        fields[n].value.len = vv->len;
+    }
+    ngx_http_torii_set_field(&fields[n], "decision", &fields[n].value,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+    n++;
+
+    vv = &r->variables[ngx_http_torii_reason_index];
+    if (vv->valid && !vv->not_found) {
+        fields[n].value.data = vv->data;
+        fields[n].value.len = vv->len;
+    }
+    ngx_http_torii_set_field(&fields[n], "reason", &fields[n].value,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+    n++;
+
+    ngx_http_torii_set_field(&fields[n++], "ua",
+                             r->headers_in.user_agent
+                             ? &r->headers_in.user_agent->value : &empty,
+                             NGX_HTTP_TORII_REPORT_HEADER_MAX);
+    ngx_http_torii_set_field(&fields[n++], "referer",
+                             r->headers_in.referer
+                             ? &r->headers_in.referer->value : &empty,
+                             NGX_HTTP_TORII_REPORT_HEADER_MAX);
+    ngx_http_torii_set_field(&fields[n++], "proto", &r->http_protocol,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+    ngx_http_torii_set_field(&fields[n++], "ctype",
+                             &r->headers_out.content_type,
+                             NGX_HTTP_TORII_REPORT_SHORT_MAX);
+
+    /* only browsers send Sec-Fetch-*; the three are reported as one value */
+
+    dest = ngx_http_torii_request_header(r, "Sec-Fetch-Dest");
+    mode = ngx_http_torii_request_header(r, "Sec-Fetch-Mode");
+    fsite = ngx_http_torii_request_header(r, "Sec-Fetch-Site");
+
+    ngx_str_null(&fetch);
+
+    if (dest || mode || fsite) {
+        fetch.data = ngx_pnalloc(r->pool,
+                                 3 * NGX_HTTP_TORII_REPORT_SHORT_MAX + 2);
+        if (fetch.data == NULL) {
+            return NULL;
+        }
+
+        fp = fetch.data;
+
+        for (i = 0; i < 3; i++) {
+            h = (i == 0) ? dest : (i == 1) ? mode : fsite;
+
+            if (i) {
+                *fp++ = '/';
+            }
+
+            if (h) {
+                fp = ngx_cpymem(fp, h->value.data,
+                                ngx_min(h->value.len,
+                                        NGX_HTTP_TORII_REPORT_SHORT_MAX));
+            }
+        }
+
+        fetch.len = fp - fetch.data;
+    }
+
+    ngx_http_torii_set_field(&fields[n++], "fetch", &fetch,
+                             3 * NGX_HTTP_TORII_REPORT_SHORT_MAX + 2);
+
+    /* the cache status has no public accessor other than its variable */
+
+    vv = ngx_http_get_variable(r, &cache_name,
+                               ngx_hash_key(cache_name.data, cache_name.len));
+
+    ngx_str_null(&fetch);
+
+    if (vv && !vv->not_found) {
+        fetch.data = vv->data;
+        fetch.len = vv->len;
+    }
+
+    /* fields[] is full: the cache status is written by hand below */
+
+    size = sizeof("{\"v\":1,\"ts\":,\"status\":,\"conn_reqs\":,\"lang\":true"
+                  ",\"rt\":,\"urt\":,\"ustatus\":,\"bytes\":,\"req_len\":"
+                  ",\"cache\":\"\"}")
+           + 2 * NGX_TIME_T_LEN + 6 * NGX_INT_T_LEN + 2 * NGX_OFF_T_LEN
+           + ngx_min(fetch.len, NGX_HTTP_TORII_REPORT_SHORT_MAX)
+           + ngx_escape_json(NULL, fetch.data,
+                             ngx_min(fetch.len,
+                                     NGX_HTTP_TORII_REPORT_SHORT_MAX));
+
+    for (i = 0; i < n; i++) {
+        if (fields[i].value.len) {
+            size += sizeof(",\"\":\"\"") - 1 + fields[i].key.len
+                    + fields[i].value.len
+                    + ngx_escape_json(NULL, fields[i].value.data,
+                                      fields[i].value.len);
+        }
+    }
+
+    buf = ngx_pnalloc(r->pool, size);
+    if (buf == NULL) {
+        return NULL;
+    }
+
+    tp = ngx_timeofday();
+
+    p = ngx_sprintf(buf, "{\"v\":1,\"ts\":%T%03M", tp->sec, tp->msec);
+
+    for (i = 0; i < n; i++) {
+        if (fields[i].value.len == 0) {
+            continue;
+        }
+
+        p = ngx_sprintf(p, ",\"%V\":\"", &fields[i].key);
+        p = (u_char *) ngx_escape_json(p, fields[i].value.data,
+                                       fields[i].value.len);
+        *p++ = '"';
+    }
+
+    if (fetch.len) {
+        p = ngx_cpymem(p, ",\"cache\":\"", sizeof(",\"cache\":\"") - 1);
+        p = (u_char *) ngx_escape_json(p, fetch.data,
+                                       ngx_min(fetch.len,
+                                           NGX_HTTP_TORII_REPORT_SHORT_MAX));
+        *p++ = '"';
+    }
+
+    /* the status as $status has it */
+
+    if (r->err_status) {
+        status = r->err_status;
+
+    } else if (r->headers_out.status) {
+        status = r->headers_out.status;
+
+    } else if (r->http_version == NGX_HTTP_VERSION_9) {
+        status = 9;
+
+    } else {
+        status = 0;
+    }
+
+    p = ngx_sprintf(p, ",\"status\":%ui,\"conn_reqs\":%ui", status,
+                    r->connection->requests);
+
+    if (ngx_http_torii_request_header(r, "Accept-Language")) {
+        p = ngx_cpymem(p, ",\"lang\":true", sizeof(",\"lang\":true") - 1);
+    }
+
+    rt = (ngx_msec_int_t) ((tp->sec - r->start_sec) * 1000
+                           + (tp->msec - r->start_msec));
+
+    p = ngx_sprintf(p, ",\"rt\":%i", (ngx_int_t) ngx_max(rt, 0));
+
+    /* the last upstream that was tried is the one that answered */
+
+    if (r->upstream_states && r->upstream_states->nelts) {
+        state = r->upstream_states->elts;
+        state += r->upstream_states->nelts - 1;
+
+        urt = (ngx_msec_int_t) state->response_time;
+        ustatus = state->status;
+
+        if (urt >= 0) {
+            p = ngx_sprintf(p, ",\"urt\":%i", (ngx_int_t) urt);
+        }
+
+        if (ustatus) {
+            p = ngx_sprintf(p, ",\"ustatus\":%ui", ustatus);
+        }
+    }
+
+    bytes = r->connection->sent - (off_t) r->header_size;
+
+    p = ngx_sprintf(p, ",\"bytes\":%O,\"req_len\":%O}", ngx_max(bytes, 0),
+                    r->request_length);
+
+    *len = p - buf;
+
+    return buf;
+}
+
+
+/* a field with an empty value is left out of the report */
+
+static void
+ngx_http_torii_set_field(ngx_http_torii_field_t *field, char *key,
+    ngx_str_t *value, size_t max)
+{
+    field->key.data = (u_char *) key;
+    field->key.len = ngx_strlen(key);
+
+    field->value.data = value->data;
+    field->value.len = ngx_min(value->len, max);
+}
+
+
+static ngx_table_elt_t *
+ngx_http_torii_request_header(ngx_http_request_t *r, char *name)
+{
+    ngx_str_t  header;
+
+    header.data = (u_char *) name;
+    header.len = ngx_strlen(name);
+
+    return ngx_http_torii_find_header(&r->headers_in.headers, &header);
+}
+
+
+static char *
+ngx_http_torii_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_torii_loc_conf_t *tlcf = conf;
+
+    ngx_str_t  *value;
+
+    if (tlcf->log != NGX_CONF_UNSET_PTR) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    if (ngx_strcmp(value[1].data, "off") == 0) {
+        tlcf->log = NULL;
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_strncmp(value[1].data, "syslog:", 7) != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid value \"%V\", expected \"off\" or "
+                           "\"syslog:server=address\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    tlcf->log = ngx_pcalloc(cf->pool, sizeof(ngx_http_torii_log_t));
+    if (tlcf->log == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    /* the address is parsed, and later written to, the way access_log does */
+
+    return ngx_syslog_process_conf(cf, &tlcf->log->peer);
+}
+
+
 /* sets the variable explicitly, so that it survives internal redirects */
 
 static void
@@ -643,6 +1046,7 @@ ngx_http_torii_create_loc_conf(ngx_conf_t *cf)
 
     conf->enable = NGX_CONF_UNSET;
     conf->on_error = NGX_CONF_UNSET_UINT;
+    conf->log = NGX_CONF_UNSET_PTR;
 
     return conf;
 }
@@ -667,6 +1071,8 @@ ngx_http_torii_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->features = prev->features;
     }
 
+    ngx_conf_merge_ptr_value(conf->log, prev->log, NULL);
+
     return NGX_CONF_OK;
 }
 
@@ -685,6 +1091,13 @@ ngx_http_torii_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_torii_handler;
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_torii_log_handler;
 
     return NGX_OK;
 }

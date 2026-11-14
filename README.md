@@ -65,6 +65,52 @@ headers both locations send to Torii.
 The Unix socket must be writable by the nginx worker user; see `listen` and
 `unix_socket_mode` in `torii.yml`.
 
+## Sites
+
+A site is identified by its ID, never by the `Host` header the client sent. `torii_site` names
+the site of a server block; the ID is one from `sites` in `torii.yml` (letters, digits and
+underscores, at most 32 characters). Torii keeps rate counters, temporary blocks, logs and
+traffic analysis separately for every site.
+
+## Request reports
+
+Torii sees a request before it is served. To learn what became of it (the status, how long it
+took, whether it was an asset) the module sends Torii a *request report* when the request has
+been served. Torii's traffic analysis works on these reports.
+
+```nginx
+http {
+    torii_log syslog:server=unix:/run/server_torii_log.sock;   # or server=127.0.0.1:25555
+}
+```
+
+The address is one of `log_listen` in `torii.yml`. Nothing else is needed: no `access_log`
+line, no `log_format`. A report is sent for every request of a server block that uses Torii
+(`torii on` or `torii_site`), including locations with `torii off` or `access_log off`, such as
+static files. `torii_log off;` switches reports off for a server or location.
+
+A report is one datagram holding one JSON object. Empty and zero fields are left out.
+
+| Field | Content |
+| --- | --- |
+| `v`, `ts` | Format version (1); when the request ended, milliseconds since the Unix epoch |
+| `site`, `ip`, `host`, `method`, `uri` | The site ID, client address, host, method and URI as requested |
+| `status`, `decision`, `reason` | Response status; Torii's decision and the check behind it |
+| `ua`, `referer`, `proto` | `User-Agent`, `Referer`, protocol |
+| `conn_reqs` | Requests made over the connection so far |
+| `fetch`, `lang` | `Sec-Fetch-Dest/Mode/Site` joined by `/`; whether `Accept-Language` was sent |
+| `ctype` | `Content-Type` of the response |
+| `rt`, `urt`, `ustatus`, `cache` | Time to serve and upstream time in milliseconds, upstream status, cache status |
+| `bytes`, `req_len` | Response body size sent, request size |
+
+Cookies, `Authorization`, other headers and bodies are never sent. `uri` is cut at 2048 bytes,
+`ua` and `referer` at 512.
+
+Reports are sent without blocking and are not retried: when Torii is not running or its socket
+buffer is full, they are lost. After a failed send the module skips reports for a second, so an
+absent Torii costs neither time nor log lines per request. A report is trusted by Torii and
+not authenticated, so use a Unix socket or a loopback address.
+
 ## Directives
 
 All directives are valid in `http`, `server` and `location`.
@@ -72,9 +118,10 @@ All directives are valid in `http`, `server` and `location`.
 | Directive | Default | Meaning |
 | --- | --- | --- |
 | `torii on \| off` | `off` | Check requests with Server Torii. |
-| `torii_site name` | — | The site whose rules apply. Without it Torii picks the site by `Host`. May contain variables. |
+| `torii_site id` | — | The ID of the site in `torii.yml` whose rules apply. Without it Torii uses its `default_site`, or gives no decision when none is configured. May contain variables. |
 | `torii_features "list"` | — | Force checks on or off for this location: `+name` or `-name`, separated by spaces or commas, for example `"-captcha +http_flood"`. Names are those of the sections in the site's `Server.yml`; case, `_` and `-` are ignored. |
 | `torii_endpoint uri` | `/_torii` | The internal location the check is sent to. |
+| `torii_log syslog:server=address \| off` | `off` | Where request reports are sent: a Unix datagram socket (`server=unix:/path`) or UDP (`server=host:port`). See *Request reports*. |
 | `torii_on_error deny \| pass` | `deny` | What to do when Torii gives no decision (unreachable, timed out, unknown site, response too large): answer 503, or let the request through. The error is logged either way. |
 
 ## Variables
@@ -131,7 +178,9 @@ NGINX_BIN=/path/to/sbin/nginx TORII_BIN=/path/to/server_torii \
 TORII_SRC=/path/to/server_torii-checkout bash t/run.sh
 ```
 
-It covers checks over TCP and a Unix socket, the pages and cookies of each
+It covers request reports (their content, delivery over a Unix socket, locations that are
+neither checked nor logged, an unreachable socket, and a block made by Torii's traffic analysis
+from them), checks over TCP and a Unix socket, the pages and cookies of each
 decision, HEAD and POST, keepalive, HTTP/2, `torii off`, `torii_features`,
 `torii_on_error`, an unreachable Torii, an oversized response, internal
 redirects and the log variables. Running it against an nginx built with

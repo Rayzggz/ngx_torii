@@ -28,6 +28,9 @@ P_DEAD=$((BASE_PORT + 6))     # Torii unreachable
 P_SMALL=$((BASE_PORT + 7))    # response larger than subrequest_output_buffer_size
 P_APP=$((BASE_PORT + 8))      # the protected application
 P_H2=$((BASE_PORT + 9))       # HTTP/2 without TLS
+P_LOG=$((BASE_PORT + 10))     # a site whose traffic Torii analyzes
+P_CAP=$((BASE_PORT + 11))     # request reports sent to a socket the test reads
+P_GONE=$((BASE_PORT + 12))    # request reports sent to a socket nobody listens on
 
 RUN=$(mktemp -d "${TMPDIR:-/tmp}/ngx-torii-t.XXXXXXXX")
 ASSERTIONS=0
@@ -75,13 +78,20 @@ mkdir -p "$RUN/torii/log" "$RUN/torii/data" "$RUN/torii/rules"
 cp -R "$TORII_SRC/tests/e2e/fixtures/pages" "$RUN/torii/pages"
 cp -R "$TORII_SRC/tests/e2e/fixtures/rules" "$RUN/torii/rules/default"
 cp -R "$TORII_SRC/tests/e2e/fixtures/rules" "$RUN/torii/rules/shop"
+# A site with traffic analysis: clients that keep getting errors are blocked.
+cp -R "$TORII_SRC/tests/e2e/fixtures/rules" "$RUN/torii/rules/logs"
+sed -i '/^AdaptiveTrafficAnalyzer:/,/^  uri_detection:/s/enabled: false/enabled: true/' "$RUN/torii/rules/logs/Server.yml"
+sed -i '/^  ip_detection:/,/^[^ ]/s/enabled: false/enabled: true/' "$RUN/torii/rules/logs/Server.yml"
 cp "$TORII_SRC/config_example/data/GeoLite2-Country.mmdb" "$RUN/torii/data/"
 # A page that does not fit a small subrequest buffer.
 head -c 4096 /dev/zero | tr '\0' 'x' >> "$RUN/torii/pages/429.html"
 SOCK="$RUN/torii/torii.sock"
+LOGSOCK="$RUN/torii/log.sock"
+CAPSOCK="$RUN/cap.sock"
 cat > "$RUN/torii/torii.yml" <<EOF
 port: "$TORII_PORT"
 listen: ["127.0.0.1:$TORII_PORT", "unix:$SOCK"]
+log_listen: ["unix:$LOGSOCK"]
 web_path: /torii
 error_page: "$RUN/torii/pages"
 log_path: "$RUN/torii/log"
@@ -89,12 +99,25 @@ global_secret: "test-only-global-secret-never-use-in-production"
 node_name: "Node_T"
 enable_gossip: false
 sites:
-  - host: default_site
+  - id: default_site
     rule_path: "$RUN/torii/rules/default"
-  - host: shop
+  - id: shop
     rule_path: "$RUN/torii/rules/shop"
+  - id: logs
+    rule_path: "$RUN/torii/rules/logs"
+default_site: default_site
 EOF
 "$TORII_BIN" -config "$RUN/torii/torii.yml" > "$RUN/torii/log/startup.log" 2>&1 &
+PIDS+=("$!")
+
+# Reads the request reports of one server block, one JSON object per line.
+python3 - "$CAPSOCK" > "$RUN/cap.jsonl" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(sys.argv[1])
+while True:
+    print(s.recv(65535).decode("utf-8", "replace"), flush=True)
+PY
 PIDS+=("$!")
 
 # ----------------------------------------------------------------------- nginx
@@ -120,9 +143,12 @@ http {
     upstream torii_unix    { server unix:$SOCK; keepalive 8; }
     upstream torii_dead    { server 127.0.0.1:1; }
 
+    torii_log syslog:server=unix:$LOGSOCK;
+
     server {
         listen 127.0.0.1:$P_APP;
         location / { return 200 "APP \$request_method \$request_uri\n"; }
+        location /missing { return 404 "missing\n"; }
     }
 
     server {
@@ -158,7 +184,7 @@ http {
     server {
         listen 127.0.0.1:$P_DENY;
         torii on;
-        torii_site no-such-site;
+        torii_site no_such_site;
         include torii/torii_endpoints.conf;
         location / { proxy_pass http://127.0.0.1:$P_APP; }
     }
@@ -166,7 +192,7 @@ http {
     server {
         listen 127.0.0.1:$P_PASS;
         torii on;
-        torii_site no-such-site;
+        torii_site no_such_site;
         torii_on_error pass;
         include torii/torii_endpoints.conf;
         location / { proxy_pass http://127.0.0.1:$P_APP; }
@@ -186,6 +212,35 @@ http {
         torii_site shop;
         torii_features "+http_flood";
         include torii/small.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+    }
+
+    server {
+        listen 127.0.0.1:$P_LOG;
+        torii on;
+        torii_site logs;
+        include torii/torii_endpoints.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+        # Not checked and not in the access log, but still reported.
+        location /assets/ { torii off; access_log off; proxy_pass http://127.0.0.1:$P_APP; }
+    }
+
+    server {
+        listen 127.0.0.1:$P_CAP;
+        torii on;
+        torii_site shop;
+        torii_log syslog:server=unix:$CAPSOCK;
+        include torii/torii_endpoints.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+        location /quiet/ { torii_log off; proxy_pass http://127.0.0.1:$P_APP; }
+    }
+
+    server {
+        listen 127.0.0.1:$P_GONE;
+        torii on;
+        torii_site shop;
+        torii_log syslog:server=unix:$RUN/gone.sock;
+        include torii/torii_endpoints.conf;
         location / { proxy_pass http://127.0.0.1:$P_APP; }
     }
 
@@ -297,19 +352,101 @@ else
     echo 'SKIP: curl has no HTTP/2 support'
 fi
 
+# ------------------------------------------------------------- request reports
+# report N FILTER: the value jq extracts from the N-th captured report.
+report() { sed -n "${1}p" "$RUN/cap.jsonl" | jq -r "$2"; }
+wait_reports() {
+    local want=$1 deadline=$((SECONDS + 5))
+    until (( $(wc -l < "$RUN/cap.jsonl") >= want )); do
+        (( SECONDS < deadline )) || fail "expected $want request reports, got $(wc -l < "$RUN/cap.jsonl")"
+        sleep 0.1
+    done
+}
+counter() { get "$P_TCP" /torii/health_check; sed -n "s/^$1=//p" "$RUN/b"; }
+
+# A served request: what the client sent and what became of it.
+get "$P_CAP" '/neutral?q=%22x%22&n=1' -A 'Report "UA"\1.0' -e 'https://ref.example/a?b=1' \
+    -H 'Sec-Fetch-Dest: document' -H 'Sec-Fetch-Mode: navigate' -H 'Sec-Fetch-Site: none' -H 'Accept-Language: en'
+assert_eq "$CODE" 200 'reported request status'
+wait_reports 1
+assert_eq "$(report 1 .v)" 1 'report version'
+assert_eq "$(report 1 .site)" shop 'report site'
+assert_eq "$(report 1 .ip)" 127.0.0.1 'report client address'
+assert_eq "$(report 1 .host)" 127.0.0.1 'report host'
+assert_eq "$(report 1 .method)" GET 'report method'
+assert_eq "$(report 1 .uri)" '/neutral?q=%22x%22&n=1' 'report URI'
+assert_eq "$(report 1 .status)" 200 'report status'
+assert_eq "$(report 1 .decision)" pass 'report decision'
+assert_eq "$(report 1 .ua)" 'Report "UA"\1.0' 'report user agent, with characters JSON escapes'
+assert_eq "$(report 1 .referer)" 'https://ref.example/a?b=1' 'report referer'
+assert_eq "$(report 1 .proto)" HTTP/1.1 'report protocol'
+assert_eq "$(report 1 .fetch)" document/navigate/none 'report fetch metadata'
+assert_eq "$(report 1 .lang)" true 'report Accept-Language'
+assert_eq "$(report 1 .ctype)" text/plain 'report content type'
+assert_eq "$(report 1 .ustatus)" 200 'report upstream status'
+assert_eq "$(report 1 .conn_reqs)" 1 'report connection request count'
+assert_eq "$(report 1 .bytes)" "$(wc -c < "$RUN/b" | tr -d ' ')" 'report body size'
+assert_eq "$(report 1 '(.rt >= 0) and (.urt >= 0) and (.req_len > 0)')" true 'report timings and request size'
+assert_eq "$(report 1 "((.ts / 1000) - $(date +%s)) | fabs < 60")" true 'report timestamp'
+
+# A request Torii answered itself: no upstream was involved.
+get "$P_CAP" /blocked
+wait_reports 2
+assert_eq "$(report 2 '[.status, .decision, .reason, .ustatus, .lang, .ua] | @json')" \
+    '[403,"block","URLBlock",null,null,"curl/'"$(curl --version | awk 'NR==1 {print $2}')"'"]' 'report of a blocked request'
+
+# torii_log off.
+get "$P_CAP" /quiet/page
+assert_eq "$CODE" 200 'torii_log off status'
+sleep 0.5
+assert_eq "$(wc -l < "$RUN/cap.jsonl" | tr -d ' ')" 2 'no report with torii_log off'
+
+# Reports reach Torii over its Unix socket, also from a location that is neither checked nor logged.
+before=$(counter reports_accepted)
+get "$P_LOG" /assets/pixel
+assert_eq "$CODE" 200 'unchecked location status'
+deadline=$((SECONDS + 5))
+until (( $(counter reports_accepted) > before )); do
+    (( SECONDS < deadline )) || fail 'the report of an unchecked, unlogged location did not arrive'
+    sleep 0.1
+done
+ASSERTIONS=$((ASSERTIONS + 1))
+assert_eq "$(counter reports_malformed)" 0 'malformed reports'
+
+# The reports drive the traffic analysis: a client that keeps getting errors is blocked on that
+# site, and only there.
+deadline=$((SECONDS + 30))
+while true; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do get "$P_LOG" /missing; done
+    [[ "$CODE" != 403 ]] || break
+    (( SECONDS < deadline )) || fail 'traffic analysis did not block the failing client'
+    sleep 0.3
+done
+assert_contains "$BODY" E2E-403 'block page of the analyzed site'
+get "$P_TCP" /neutral
+assert_eq "$CODE" 200 'the block stays on its site'
+
+# Nobody listens: requests are served as usual, and the failure is not logged for each of them.
+for _ in $(seq 30); do get "$P_GONE" /neutral; done
+assert_eq "$CODE" 200 'status with an unreachable report socket'
+ASSERTIONS=$((ASSERTIONS + 1))
+gone=$(grep -c 'gone.sock' "$RUN/nginx/logs/error.log" || true)
+(( gone >= 1 && gone <= 6 )) || fail "expected a few log lines about the unreachable report socket, got $gone"
+
 # Logs: variables, check count, and nothing alarming.
 sleep 0.3
 LOG=$(cat "$RUN/nginx/logs/access.log")
 assert_contains "$LOG" '/neutral|200|pass|-|shop' 'access log: pass'
 assert_contains "$LOG" '/blocked|403|block|URLBlock|shop' 'access log: block with reason'
 assert_contains "$LOG" '/challenge|503|captcha|URLCAPTCHA|shop' 'access log: captcha with reason'
-assert_contains "$LOG" '/neutral|503|error|-|no-such-site' 'access log: error'
+assert_contains "$LOG" '/neutral|503|error|-|no_such_site' 'access log: error'
 assert_contains "$LOG" '/redirected?marker=once|200|pass|-|shop' 'access log: decision survives the redirect'
 
 "$NGINX_BIN" -p "$RUN/nginx" -c conf/nginx.conf -s quit
 for _ in $(seq 50); do [[ -f "$RUN/nginx/logs/nginx.pid" ]] || break; sleep 0.1; done
 ASSERTIONS=$((ASSERTIONS + 1))
-if grep -E '\[(alert|emerg|crit)\]|AddressSanitizer|LeakSanitizer|runtime error' "$RUN/nginx/logs/error.log" > "$RUN/bad.log"; then
+if grep -v 'gone.sock' "$RUN/nginx/logs/error.log" \
+    | grep -E '\[(alert|emerg|crit)\]|AddressSanitizer|LeakSanitizer|runtime error' > "$RUN/bad.log"; then
     head -n 20 "$RUN/bad.log" >&2
     fail 'nginx logged an alert or a sanitizer report'
 fi
