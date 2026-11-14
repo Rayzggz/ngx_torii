@@ -4,14 +4,20 @@
 #   NGINX_BIN=/path/to/sbin/nginx TORII_BIN=/path/to/server_torii \
 #   TORII_SRC=/path/to/server_torii-checkout bash t/run.sh
 #
+# nginx must be built with --with-debug and --with-http_v2_module.
 # TORII_SRC provides the test rules and pages (tests/e2e/fixtures) and the GeoIP
 # database. Everything runs on loopback out of a temporary directory.
+#
+# When the module was built with --add-dynamic-module, also set
+# NGX_TORII_MODULE=/path/to/ngx_http_torii_module.so. t/matrix.sh builds nginx
+# versions and runs this test against each.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${NGINX_BIN:?set NGINX_BIN to an nginx built with this module}"
 : "${TORII_BIN:?set TORII_BIN to a server_torii binary}"
 : "${TORII_SRC:?set TORII_SRC to a server_torii checkout}"
+NGX_TORII_MODULE=${NGX_TORII_MODULE:-}
 BASE_PORT=${BASE_PORT:-28100}
 KEEP=${KEEP:-0}
 # nginx does not free its configuration on exit; under ASAN that is reported as a leak
@@ -121,6 +127,31 @@ PY
 PIDS+=("$!")
 
 # ----------------------------------------------------------------------- nginx
+# "nginx version: nginx/1.26.3" or "nginx version: openresty/1.27.1.2".
+NGINX_VERSION=$("$NGINX_BIN" -v 2>&1 | sed -n 's|^nginx version: [^/]*/\([0-9.]*\).*|\1|p')
+[[ -n "$NGINX_VERSION" ]] || fail "cannot read the version of $NGINX_BIN"
+# version_ge A B: version A is B or newer, comparing the first three components.
+version_ge() {
+    local a b
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    local i
+    for i in 0 1 2; do
+        (( ${a[i]:-0} > ${b[i]:-0} )) && return 0
+        (( ${a[i]:-0} < ${b[i]:-0} )) && return 1
+    done
+    return 0
+}
+# The "http2" directive replaced the "http2" parameter of "listen" in 1.25.1.
+if version_ge "$NGINX_VERSION" 1.25.1; then
+    H2_LISTEN='' H2_DIRECTIVE='http2 on;'
+else
+    H2_LISTEN=' http2' H2_DIRECTIVE=''
+fi
+LOAD_MODULE=''
+[[ -z "$NGX_TORII_MODULE" ]] || LOAD_MODULE="load_module $NGX_TORII_MODULE;"
+echo "nginx $NGINX_VERSION${NGX_TORII_MODULE:+, dynamic module}"
+
 mkdir -p "$RUN/nginx/logs" "$RUN/nginx/conf/torii"
 cp "$ROOT/conf/"*.conf "$RUN/nginx/conf/torii/"
 # The same endpoints with another upstream or buffer size, for the failure cases.
@@ -130,6 +161,7 @@ sed 's/subrequest_output_buffer_size 64k/subrequest_output_buffer_size 1k/' \
     "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/small.conf"
 
 cat > "$RUN/nginx/conf/nginx.conf" <<EOF
+$LOAD_MODULE
 daemon on;
 worker_processes 1;
 error_log logs/error.log debug;
@@ -245,8 +277,8 @@ http {
     }
 
     server {
-        listen 127.0.0.1:$P_H2;
-        http2 on;
+        listen 127.0.0.1:$P_H2$H2_LISTEN;
+        $H2_DIRECTIVE
         torii on;
         torii_site shop;
         include torii/torii_endpoints.conf;
@@ -430,7 +462,9 @@ assert_eq "$CODE" 200 'the block stays on its site'
 for _ in $(seq 30); do get "$P_GONE" /neutral; done
 assert_eq "$CODE" 200 'status with an unreachable report socket'
 ASSERTIONS=$((ASSERTIONS + 1))
-gone=$(grep -c 'gone.sock' "$RUN/nginx/logs/error.log" || true)
+# Counted by the module's own warning: nginx before 1.23.4 does not name the socket in its
+# "connect() failed" line.
+gone=$(grep -c 'sending a request report failed' "$RUN/nginx/logs/error.log" || true)
 (( gone >= 1 && gone <= 6 )) || fail "expected a few log lines about the unreachable report socket, got $gone"
 
 # Logs: variables, check count, and nothing alarming.
@@ -445,7 +479,7 @@ assert_contains "$LOG" '/redirected?marker=once|200|pass|-|shop' 'access log: de
 "$NGINX_BIN" -p "$RUN/nginx" -c conf/nginx.conf -s quit
 for _ in $(seq 50); do [[ -f "$RUN/nginx/logs/nginx.pid" ]] || break; sleep 0.1; done
 ASSERTIONS=$((ASSERTIONS + 1))
-if grep -v 'gone.sock' "$RUN/nginx/logs/error.log" \
+if grep -v 'gone.sock\|connect() failed (2: No such file or directory)$' "$RUN/nginx/logs/error.log" \
     | grep -E '\[(alert|emerg|crit)\]|AddressSanitizer|LeakSanitizer|runtime error' > "$RUN/bad.log"; then
     head -n 20 "$RUN/bad.log" >&2
     fail 'nginx logged an alert or a sanitizer report'

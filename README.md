@@ -14,7 +14,9 @@ This version speaks connector protocol v1 and is **not compatible** with the
 ## Requirements
 
 - nginx 1.13.10 or newer (the module keeps the response of the check in memory,
-  which needs `subrequest_output_buffer_size`). Tested with nginx 1.30.6.
+  which needs `subrequest_output_buffer_size`), or an OpenResty based on one.
+  Tested with nginx 1.14.2, 1.16.1, 1.18.0, 1.20.2, 1.22.1, 1.24.0, 1.26.3, 1.28.0
+  and 1.30.6, and with OpenResty 1.27.1.2, built into nginx and as a dynamic module.
 - A server_torii that serves `/v1/check` and `/v1/public/`.
 
 ## Build
@@ -178,7 +180,18 @@ NGINX_BIN=/path/to/sbin/nginx TORII_BIN=/path/to/server_torii \
 TORII_SRC=/path/to/server_torii-checkout bash t/run.sh
 ```
 
-It covers request reports (their content, delivery over a Unix socket, locations that are
+nginx must be built with `--with-debug` and `--with-http_v2_module`; for a dynamic build
+also set `NGX_TORII_MODULE=/path/to/ngx_http_torii_module.so`.
+
+`t/matrix.sh` downloads and builds a list of nginx and OpenResty versions with the module
+and runs that test against each; CI runs it on every push:
+
+```bash
+TORII_SRC=/path/to/server_torii-checkout bash t/matrix.sh                 # the default list
+TORII_SRC=/path/to/server_torii-checkout bash t/matrix.sh 1.26.3 1.28.0+dynamic openresty-1.27.1.2
+```
+
+The test covers request reports (their content, delivery over a Unix socket, locations that are
 neither checked nor logged, an unreachable socket, and a block made by Torii's traffic analysis
 from them), checks over TCP and a Unix socket, the pages and cookies of each
 decision, HEAD and POST, keepalive, HTTP/2, `torii off`, `torii_features`,
