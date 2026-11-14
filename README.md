@@ -51,7 +51,7 @@ http {
 
         location /api/ {
             torii on;
-            torii_features "-captcha";         # no CAPTCHA for the API
+            torii_features "-challenge";       # do not challenge the API
             proxy_pass http://localhost:3001/;
         }
     }
@@ -121,7 +121,7 @@ All directives are valid in `http`, `server` and `location`.
 | --- | --- | --- |
 | `torii on \| off` | `off` | Check requests with Server Torii. |
 | `torii_site id` | — | The ID of the site in `torii.yml` whose rules apply. Without it Torii uses its `default_site`, or gives no decision when none is configured. May contain variables. |
-| `torii_features "list"` | — | Force checks on or off for this location: `+name` or `-name`, separated by spaces or commas, for example `"-captcha +http_flood"`. Names are those of the sections in the site's `Server.yml`; case, `_` and `-` are ignored. |
+| `torii_features "list"` | — | Force checks on or off for this location: `+name` or `-name`, separated by spaces or commas, for example `"-challenge +http_flood"`. Names are those of the sections in the site's `Server.yml`; case, `_` and `-` are ignored. |
 | `torii_endpoint uri` | `/_torii` | The internal location the check is sent to. |
 | `torii_log syslog:server=address \| off` | `off` | Where request reports are sent: a Unix datagram socket (`server=unix:/path`) or UDP (`server=host:port`). See *Request reports*. |
 | `torii_on_error deny \| pass` | `deny` | What to do when Torii gives no decision (unreachable, timed out, unknown site, response too large): answer 503, or let the request through. The error is logged either way. |
@@ -130,8 +130,8 @@ All directives are valid in `http`, `server` and `location`.
 
 | Variable | Value |
 | --- | --- |
-| `$torii_decision` | `pass`, `block`, `captcha`, `rate_limit`, `external`, or `error` when Torii gave no decision. Empty when the request was not checked. |
-| `$torii_reason` | The check that stopped the request, for example `URLBlock` or `HTTPFlood`. |
+| `$torii_decision` | `pass`, `block`, `challenge`, `rate_limit`, or `error` when Torii gave no decision. Empty when the request was not checked. A challenge is the CAPTCHA page of the site, or a redirect to its external provider. |
+| `$torii_reason` | The check behind the decision, for example `URLBlock` or `HTTPFlood`. For a challenge it is the check whose rule asked for it, or `Challenge` when the site challenges every client. |
 | `$torii_site`, `$torii_features` | The values configured for the location of the request. |
 
 ```nginx

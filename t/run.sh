@@ -210,7 +210,7 @@ http {
         torii_features "-url_block";
         include torii/torii_endpoints.conf;
         location / { proxy_pass http://127.0.0.1:$P_APP; }
-        location /strict/ { torii_features "+captcha"; proxy_pass http://127.0.0.1:$P_APP; }
+        location /strict/ { torii_features "+challenge"; proxy_pass http://127.0.0.1:$P_APP; }
     }
 
     server {
@@ -472,7 +472,7 @@ sleep 0.3
 LOG=$(cat "$RUN/nginx/logs/access.log")
 assert_contains "$LOG" '/neutral|200|pass|-|shop' 'access log: pass'
 assert_contains "$LOG" '/blocked|403|block|URLBlock|shop' 'access log: block with reason'
-assert_contains "$LOG" '/challenge|503|captcha|URLCAPTCHA|shop' 'access log: captcha with reason'
+assert_contains "$LOG" '/challenge|503|challenge|URLCAPTCHA|shop' 'access log: challenge with reason'
 assert_contains "$LOG" '/neutral|503|error|-|no_such_site' 'access log: error'
 assert_contains "$LOG" '/redirected?marker=once|200|pass|-|shop' 'access log: decision survives the redirect'
 
