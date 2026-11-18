@@ -326,6 +326,14 @@ http {
 }
 EOF
 "$NGINX_BIN" -p "$RUN/nginx" -c conf/nginx.conf -t 2> "$RUN/nginx-t.log" || { cat "$RUN/nginx-t.log" >&2; fail 'nginx -t'; }
+
+# nginx reports every request, the readiness probes below included. A report sent before its
+# listener exists is an [alert] in the error log, so nginx starts once the sockets are there.
+deadline=$((SECONDS + 20))
+until [[ -S "$SOCK" && -S "$LOGSOCK" && -S "$CAPSOCK" ]]; do
+    (( SECONDS < deadline )) || fail 'Torii and the report reader did not open their sockets within 20 seconds'
+    sleep 0.1
+done
 "$NGINX_BIN" -p "$RUN/nginx" -c conf/nginx.conf
 
 deadline=$((SECONDS + 20))
