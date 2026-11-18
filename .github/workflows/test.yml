@@ -4,21 +4,30 @@ on:
   push:
     branches: [master, main, connector-v1]
   pull_request:
+  # Run by hand ("Run workflow") to also run the integration test against a Server Torii.
+  workflow_dispatch:
+    inputs:
+      torii_ref:
+        description: "Server Torii branch, tag or commit for the integration test (empty: build only)"
+        required: false
+        default: ""
+      torii_repository:
+        description: Server Torii repository
+        required: false
+        default: Rayzggz/server_torii
 
 permissions:
   contents: read
 
 concurrency:
-  group: test-${{ github.ref }}
+  group: test-${{ github.ref }}-${{ inputs.torii_ref }}
   cancel-in-progress: true
 
-env:
-  # The Server Torii branch or tag the module is tested against. It must serve connector
-  # protocol v1 (/v1/check).
-  TORII_REF: refactor
-
 jobs:
-  integration:
+  # On a push: builds the module into each version and lets "nginx -t" load a configuration that
+  # uses it; no Server Torii is involved. Run by hand with a Server Torii ref: the integration
+  # test (t/run.sh) runs against that Torii instead.
+  build:
     name: ${{ matrix.target }}
     runs-on: ubuntu-24.04
     strategy:
@@ -41,21 +50,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libpcre2-dev zlib1g-dev perl curl jq python3
+
+      - name: Build nginx with the module
+        if: ${{ !inputs.torii_ref }}
+        run: BUILD_ONLY=1 bash t/matrix.sh "${{ matrix.target }}"
+
+      - name: Check out Server Torii
+        if: ${{ inputs.torii_ref }}
+        uses: actions/checkout@v5
         with:
-          repository: Rayzggz/server_torii
-          ref: ${{ env.TORII_REF }}
+          repository: ${{ inputs.torii_repository }}
+          ref: ${{ inputs.torii_ref }}
           path: .server_torii
 
-      - uses: actions/setup-go@v6
+      - if: ${{ inputs.torii_ref }}
+        uses: actions/setup-go@v6
         with:
           go-version-file: .server_torii/go.mod
           cache-dependency-path: .server_torii/go.sum
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libpcre2-dev zlib1g-dev perl curl jq python3
-
       - name: Build nginx with the module and run the integration test
+        if: ${{ inputs.torii_ref }}
         run: TORII_SRC="$PWD/.server_torii" bash t/matrix.sh "${{ matrix.target }}"
 
       - name: Build log

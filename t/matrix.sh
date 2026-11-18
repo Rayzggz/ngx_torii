@@ -7,6 +7,9 @@
 # one followed by "+dynamic" to build the module as a shared object ("1.26.3+dynamic").
 # Without targets the default list below is used.
 #
+# BUILD_ONLY=1 needs no Server Torii: each target is built and "nginx -t" loads a configuration
+# that uses the module's directives, and the integration test is not run. CI does this.
+#
 # Sources are downloaded from nginx.org and openresty.org; builds are kept in CACHE
 # (default ~/.cache/ngx-torii-matrix) and reused. Needs a C toolchain, zlib and PCRE2
 # headers, curl, perl (OpenResty) and Go (to build Server Torii).
@@ -16,7 +19,8 @@
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-: "${TORII_SRC:?set TORII_SRC to a server_torii checkout}"
+BUILD_ONLY=${BUILD_ONLY:-0}
+[[ "$BUILD_ONLY" == 1 ]] || : "${TORII_SRC:?set TORII_SRC to a server_torii checkout, or BUILD_ONLY=1}"
 CACHE=${CACHE:-$HOME/.cache/ngx-torii-matrix}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 2)}
 PCRE1_VERSION=8.45
@@ -103,8 +107,45 @@ build() {
     touch "$dir/.built"
 }
 
-echo "Building Server Torii"
-(cd "$TORII_SRC" && go build -o "$CACHE/server_torii" ./cmd/server_torii)
+# smoke: "nginx -t" on a configuration with every directive of the module. Nothing is started,
+# but "nginx -t" binds the listen address for a moment.
+smoke() {
+    local dir load='' status=0
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/ngx-torii-smoke.XXXXXXXX")
+    mkdir -p "$dir/logs" "$dir/conf/torii"
+    cp "$ROOT/conf/"*.conf "$dir/conf/torii/"
+    [[ -z "$MODULE_SO" ]] || load="load_module $MODULE_SO;"
+    cat > "$dir/conf/nginx.conf" <<EOF
+$load
+error_log logs/error.log;
+pid logs/nginx.pid;
+events {}
+http {
+    access_log off;
+    upstream torii_backend { server 127.0.0.1:1; }
+    torii_log syslog:server=127.0.0.1:1;
+    server {
+        listen 127.0.0.1:${BASE_PORT:-28100};
+        torii on;
+        torii_site smoke;
+        torii_on_error pass;
+        torii_features "-url_block";
+        include torii/torii_endpoints.conf;
+        location / { return 200; }
+        location /open/ { torii off; torii_log off; return 200; }
+    }
+}
+EOF
+    # nginx does not free its configuration on exit; under ASAN that is reported as a leak.
+    ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} "$NGINX_BIN" -p "$dir" -c conf/nginx.conf -t 2>&1 || status=$?
+    rm -rf -- "$dir"
+    return "$status"
+}
+
+if [[ "$BUILD_ONLY" != 1 ]]; then
+    echo "Building Server Torii"
+    (cd "$TORII_SRC" && go build -o "$CACHE/server_torii" ./cmd/server_torii)
+fi
 
 passed=() failed=()
 for target in "${targets[@]}"; do
@@ -112,6 +153,10 @@ for target in "${targets[@]}"; do
     if ! build "$target"; then
         echo "   BUILD FAILED (log: $CACHE/build/$target/build.log)"
         failed+=("$target (build)")
+        continue
+    fi
+    if [[ "$BUILD_ONLY" == 1 ]]; then
+        if smoke | sed 's/^/   /'; then passed+=("$target"); else failed+=("$target (nginx -t)"); fi
         continue
     fi
     if NGINX_BIN="$NGINX_BIN" NGX_TORII_MODULE="$MODULE_SO" TORII_BIN="$CACHE/server_torii" TORII_SRC="$TORII_SRC" \

@@ -184,7 +184,7 @@ nginx must be built with `--with-debug` and `--with-http_v2_module`; for a dynam
 also set `NGX_TORII_MODULE=/path/to/ngx_http_torii_module.so`.
 
 `t/matrix.sh` downloads and builds a list of nginx and OpenResty versions with the module
-and runs that test against each; CI runs it on every push:
+and runs that test against each:
 
 ```bash
 TORII_SRC=/path/to/server_torii-checkout bash t/matrix.sh                 # the default list
