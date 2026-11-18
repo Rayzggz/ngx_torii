@@ -86,7 +86,7 @@ cp -R "$TORII_SRC/tests/e2e/fixtures/rules" "$RUN/torii/rules/default"
 cp -R "$TORII_SRC/tests/e2e/fixtures/rules" "$RUN/torii/rules/shop"
 # A site with traffic analysis: clients that keep getting errors are blocked.
 cp -R "$TORII_SRC/tests/e2e/fixtures/rules" "$RUN/torii/rules/logs"
-sed -i '/^AdaptiveTrafficAnalyzer:/,/^  uri_detection:/s/enabled: false/enabled: true/' "$RUN/torii/rules/logs/Server.yml"
+sed -i '/^traffic_analyzer:/,/^  uri_detection:/s/enabled: false/enabled: true/' "$RUN/torii/rules/logs/Server.yml"
 sed -i '/^  ip_detection:/,/^[^ ]/s/enabled: false/enabled: true/' "$RUN/torii/rules/logs/Server.yml"
 cp "$TORII_SRC/config_example/data/GeoLite2-Country.mmdb" "$RUN/torii/data/"
 # A page that does not fit a small subrequest buffer.
@@ -95,7 +95,6 @@ SOCK="$RUN/torii/torii.sock"
 LOGSOCK="$RUN/torii/log.sock"
 CAPSOCK="$RUN/cap.sock"
 cat > "$RUN/torii/torii.yml" <<EOF
-port: "$TORII_PORT"
 listen: ["127.0.0.1:$TORII_PORT", "unix:$SOCK"]
 log_listen: ["unix:$LOGSOCK"]
 web_path: /torii
@@ -103,7 +102,6 @@ error_page: "$RUN/torii/pages"
 log_path: "$RUN/torii/log"
 global_secret: "test-only-global-secret-never-use-in-production"
 node_name: "Node_T"
-enable_gossip: false
 sites:
   - id: default_site
     rule_path: "$RUN/torii/rules/default"
@@ -425,7 +423,7 @@ assert_eq "$(report 1 "((.ts / 1000) - $(date +%s)) | fabs < 60")" true 'report 
 get "$P_CAP" /blocked
 wait_reports 2
 assert_eq "$(report 2 '[.status, .decision, .reason, .ustatus, .lang, .ua] | @json')" \
-    '[403,"block","URLBlock",null,null,"curl/'"$(curl --version | awk 'NR==1 {print $2}')"'"]' 'report of a blocked request'
+    '[403,"block","Lists:url_block",null,null,"curl/'"$(curl --version | awk 'NR==1 {print $2}')"'"]' 'report of a blocked request'
 
 # torii_log off.
 get "$P_CAP" /quiet/page
@@ -471,8 +469,8 @@ gone=$(grep -c 'sending a request report failed' "$RUN/nginx/logs/error.log" || 
 sleep 0.3
 LOG=$(cat "$RUN/nginx/logs/access.log")
 assert_contains "$LOG" '/neutral|200|pass|-|shop' 'access log: pass'
-assert_contains "$LOG" '/blocked|403|block|URLBlock|shop' 'access log: block with reason'
-assert_contains "$LOG" '/challenge|503|challenge|URLCAPTCHA|shop' 'access log: challenge with reason'
+assert_contains "$LOG" '/blocked|403|block|Lists:url_block|shop' 'access log: block with reason'
+assert_contains "$LOG" '/challenge|503|challenge|Lists:url_captcha|shop' 'access log: challenge with reason'
 assert_contains "$LOG" '/neutral|503|error|-|no_such_site' 'access log: error'
 assert_contains "$LOG" '/redirected?marker=once|200|pass|-|shop' 'access log: decision survives the redirect'
 
