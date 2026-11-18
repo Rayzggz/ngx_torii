@@ -452,7 +452,10 @@ wait_reports() {
         sleep 0.1
     done
 }
-counter() { get "$P_TCP" /torii/health_check; sed -n "s/^$1=//p" "$RUN/b"; }
+# The health check shows its counters to whoever has the key derived from global_secret.
+HEALTH_KEY=$(printf '%s' 'torii health key' \
+    | openssl dgst -sha256 -hmac 'test-only-global-secret-never-use-in-production' | awk '{print substr($NF,1,32)}')
+counter() { get "$P_TCP" "/torii/health_check?key=$HEALTH_KEY"; sed -n "s/^$1=//p" "$RUN/b"; }
 
 # A served request: what the client sent and what became of it.
 get "$P_CAP" '/neutral?q=%22x%22&n=1' -A 'Report "UA"\1.0' -e 'https://ref.example/a?b=1' \

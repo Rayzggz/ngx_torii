@@ -16,7 +16,7 @@ This version speaks connector protocol v1 and is **not compatible** with the
 - nginx 1.13.10 or newer (the module keeps the response of the check in memory,
   which needs `subrequest_output_buffer_size`), or an OpenResty based on one.
   Tested with nginx 1.14.2, 1.16.1, 1.18.0, 1.20.2, 1.22.1, 1.24.0, 1.26.3, 1.28.0
-  and 1.30.6, and with OpenResty 1.27.1.2, built into nginx and as a dynamic module.
+  and 1.30.7, and with OpenResty 1.27.1.2, built into nginx and as a dynamic module.
 - A server_torii that serves `/v1/check` and `/v1/public/`.
 
 ## Build
