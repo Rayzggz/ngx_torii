@@ -109,8 +109,9 @@ Cookies, `Authorization`, other headers and bodies are never sent. `uri` is cut 
 `ua` and `referer` at 512.
 
 Reports are sent without blocking and are not retried: when Torii is not running or its socket
-buffer is full, they are lost. After a failed send the module skips reports for a second, so an
-absent Torii costs neither time nor log lines per request. A report is trusted by Torii and
+buffer is full, they are lost. A full buffer costs only the report that did not fit. When Torii
+is not running the module skips reports for a second after a failed send, so an absent Torii
+costs neither time nor log lines per request. A report is trusted by Torii and
 not authenticated, so use a Unix socket or a loopback address.
 
 ## Directives
@@ -122,9 +123,9 @@ All directives are valid in `http`, `server` and `location`.
 | `torii on \| off` | `off` | Check requests with Server Torii. |
 | `torii_site id` | — | The ID of the site in `torii.yml` whose rules apply. Without it Torii uses its `default_site`, or gives no decision when none is configured. May contain variables. |
 | `torii_features "list"` | — | Force checks on or off for this location: `+name` or `-name`, separated by spaces or commas, for example `"-challenge +http_flood"`. Names are those of the sections in the site's `Server.yml`; case, `_` and `-` are ignored. The lists of the site are switched the same way, by the name they have in `lists`: `"-url_block"`. |
-| `torii_endpoint uri` | `/_torii` | The internal location the check is sent to. |
+| `torii_endpoint uri` | `/_torii` | The location the check is sent to. It must be `internal`: a check that reaches any other location is refused and counts as "no decision", so a server without `torii_endpoints.conf` does not send its checks to the application. |
 | `torii_log syslog:server=address \| off` | `off` | Where request reports are sent: a Unix datagram socket (`server=unix:/path`) or UDP (`server=host:port`). See *Request reports*. |
-| `torii_on_error deny \| pass` | `deny` | What to do when Torii gives no decision (unreachable, timed out, unknown site, response too large): answer 503, or let the request through. The error is logged either way. |
+| `torii_on_error deny \| pass` | `deny` | What to do when Torii gives no decision (unreachable, timed out, unknown site, response too large or incomplete): answer 503, or let the request through. The error is logged either way. |
 
 ## Variables
 
@@ -152,8 +153,7 @@ log_format torii '$remote_addr "$request" $status $torii_decision $torii_reason'
   by itself, also with `satisfy any`.
 - **Response size.** Torii's answer is held in memory, limited by
   `subrequest_output_buffer_size` in `torii_endpoints.conf` (64k). A larger page
-  counts as "no decision". This relies on Torii sending `Content-Length`, which
-  it does for its pages.
+  counts as "no decision", and so does a response that Torii does not finish.
 - **Timeouts.** `torii_endpoints.conf` sets short proxy timeouts so that a slow
   Torii cannot hold client requests; `max_conns` on the upstream server bounds
   the number of concurrent checks.
@@ -195,6 +195,6 @@ The test covers request reports (their content, delivery over a Unix socket, loc
 neither checked nor logged, an unreachable socket, and a block made by Torii's traffic analysis
 from them), checks over TCP and a Unix socket, the pages and cookies of each
 decision, HEAD and POST, keepalive, HTTP/2, `torii off`, `torii_features`,
-`torii_on_error`, an unreachable Torii, an oversized response, internal
+`torii_on_error`, an unreachable Torii, an oversized or incomplete response, internal
 redirects and the log variables. Running it against an nginx built with
 AddressSanitizer also checks the module for memory errors.

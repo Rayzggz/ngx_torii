@@ -20,7 +20,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CACHE=${CACHE:-$HOME/.cache/ngx-torii-matrix}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 2)}
 PCRE1_VERSION=8.45
-DEFAULT_TARGETS=(1.14.2 1.16.1 1.18.0 1.20.2 1.22.1 1.24.0 1.26.3 1.28.0 1.28.0+dynamic openresty-1.27.1.2)
+DEFAULT_TARGETS=(1.14.2 1.16.1 1.18.0 1.20.2 1.22.1 1.24.0 1.26.3 1.28.0 1.30.6 1.28.0+dynamic openresty-1.27.1.2)
 
 targets=("$@")
 (( ${#targets[@]} > 0 )) || targets=("${DEFAULT_TARGETS[@]}")

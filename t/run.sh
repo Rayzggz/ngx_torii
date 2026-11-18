@@ -37,6 +37,9 @@ P_H2=$((BASE_PORT + 9))       # HTTP/2 without TLS
 P_LOG=$((BASE_PORT + 10))     # a site whose traffic Torii analyzes
 P_CAP=$((BASE_PORT + 11))     # request reports sent to a socket the test reads
 P_GONE=$((BASE_PORT + 12))    # request reports sent to a socket nobody listens on
+STALL_PORT=$((BASE_PORT + 13)) # a Torii that stops in the middle of its response
+P_STALL=$((BASE_PORT + 14))   # checks sent to it, torii_on_error pass
+P_NOEP=$((BASE_PORT + 15))    # "torii on" without the endpoint locations
 
 RUN=$(mktemp -d "${TMPDIR:-/tmp}/ngx-torii-t.XXXXXXXX")
 ASSERTIONS=0
@@ -124,6 +127,23 @@ while True:
 PY
 PIDS+=("$!")
 
+# A Torii that sends its headers and half of the body, then nothing more.
+python3 - "$STALL_PORT" <<'PY' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(8)
+held = []
+while True:
+    c, _ = s.accept()
+    c.recv(65535)
+    c.sendall(b"HTTP/1.1 403 Forbidden\r\nTorii-Decision: block\r\nContent-Type: text/html\r\n"
+              b"Content-Length: 100\r\n\r\nhalf a page")
+    held.append(c)
+PY
+PIDS+=("$!")
+
 # ----------------------------------------------------------------------- nginx
 # "nginx version: nginx/1.26.3" or "nginx version: openresty/1.27.1.2".
 NGINX_VERSION=$("$NGINX_BIN" -v 2>&1 | sed -n 's|^nginx version: [^/]*/\([0-9.]*\).*|\1|p')
@@ -157,6 +177,8 @@ sed 's/torii_backend/torii_unix/' "$ROOT/conf/torii_endpoints.conf" > "$RUN/ngin
 sed 's/torii_backend/torii_dead/' "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/dead.conf"
 sed 's/subrequest_output_buffer_size 64k/subrequest_output_buffer_size 1k/' \
     "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/small.conf"
+sed 's/torii_backend/torii_stall/; s/proxy_read_timeout 5s/proxy_read_timeout 1s/' \
+    "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/stall.conf"
 
 cat > "$RUN/nginx/conf/nginx.conf" <<EOF
 $LOAD_MODULE
@@ -172,11 +194,13 @@ http {
     upstream torii_backend { server 127.0.0.1:$TORII_PORT; keepalive 8; }
     upstream torii_unix    { server unix:$SOCK; keepalive 8; }
     upstream torii_dead    { server 127.0.0.1:1; }
+    upstream torii_stall   { server 127.0.0.1:$STALL_PORT; }
 
     torii_log syslog:server=unix:$LOGSOCK;
 
     server {
         listen 127.0.0.1:$P_APP;
+        access_log logs/app.log torii;
         location / { return 200 "APP \$request_method \$request_uri\n"; }
         location /missing { return 404 "missing\n"; }
     }
@@ -242,6 +266,23 @@ http {
         torii_site shop;
         torii_features "+http_flood";
         include torii/small.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+    }
+
+    server {
+        listen 127.0.0.1:$P_STALL;
+        torii on;
+        torii_site shop;
+        torii_on_error pass;
+        include torii/stall.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+    }
+
+    server {
+        listen 127.0.0.1:$P_NOEP;
+        torii on;
+        torii_site shop;
+        torii_on_error pass;
         location / { proxy_pass http://127.0.0.1:$P_APP; }
     }
 
@@ -362,6 +403,17 @@ get "$P_SMALL" /neutral
 assert_eq "$CODE" 200 'small buffer still fits a pass'
 for i in 1 2 3 4 5 6; do get "$P_SMALL" "/flood$i"; done
 assert_eq "$CODE" 503 'page larger than the buffer is no decision'
+# A response that stops halfway is no decision either, not a closed client connection.
+get "$P_STALL" /neutral
+assert_eq "$CODE" 200 'incomplete response, on_error pass'
+assert_eq "$BODY" 'APP GET /neutral' 'incomplete response, on_error pass body'
+# Without the endpoint location the check is refused instead of being sent to the application.
+get "$P_NOEP" /neutral
+assert_eq "$CODE" 200 'no endpoint location, on_error pass'
+sleep 0.3
+ASSERTIONS=$((ASSERTIONS + 2))
+grep -q 'did not reach an internal location' "$RUN/nginx/logs/error.log" || fail 'a missing endpoint location is not named in the error log'
+! grep -q '^/_torii' "$RUN/nginx/logs/app.log" || fail 'the check reached the application'
 
 # One check per client request, even across an internal redirect.
 checks_before=$(grep -c 'torii check done' "$RUN/nginx/logs/error.log" || true)
