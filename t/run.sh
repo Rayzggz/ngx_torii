@@ -207,6 +207,7 @@ LOAD_MODULE=''
 echo "nginx $NGINX_VERSION${NGX_TORII_MODULE:+, dynamic module}$NO_SSL"
 
 mkdir -p "$RUN/nginx/logs" "$RUN/nginx/conf/torii"
+head -c 524288 /dev/zero > "$RUN/nginx/big.bin"
 cp "$ROOT/conf/"*.conf "$RUN/nginx/conf/torii/"
 # The same endpoints with another upstream or buffer size, for the failure cases.
 sed 's/torii_backend/torii_unix/' "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/unix.conf"
@@ -269,6 +270,8 @@ http {
         access_log logs/app.log torii;
         location / { return 200 "APP \$request_method \$request_uri\n"; }
         location /missing { return 404 "missing\n"; }
+        # A response that takes a minute to send.
+        location = /big.bin { root $RUN/nginx; limit_rate 8k; }
     }
 
     server {
@@ -683,6 +686,12 @@ get "$P_CAP" /quiet/page
 assert_eq "$CODE" 200 'torii_log off status'
 sleep 0.5
 assert_eq "$(wc -l < "$RUN/cap.jsonl" | tr -d ' ')" 2 'no report with torii_log off'
+
+# A client that goes away in the middle of the response: the status says nothing of it.
+assert_eq "$(report 1 .incomplete)" null 'a response sent to its end is not reported as incomplete'
+curl --silent --noproxy '*' --max-time 1 -o /dev/null "http://127.0.0.1:$P_CAP/big.bin" || true
+wait_reports 3
+assert_eq "$(report 3 '[.status, .incomplete] | @json')" '[200,true]' 'report of a response the client did not wait for'
 
 # Reports reach Torii over its Unix socket, also from a location that is neither checked nor logged.
 before=$(counter reports_accepted)

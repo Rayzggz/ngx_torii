@@ -108,6 +108,7 @@ A report is one datagram holding one JSON object. Empty and zero fields are left
 | `fetch`, `lang` | `Sec-Fetch-Dest/Mode/Site` joined by `/`; whether `Accept-Language` was sent |
 | `ctype` | `Content-Type` of the response |
 | `rt`, `urt`, `ustatus`, `cache` | Time to serve and upstream time in milliseconds, upstream status, cache status |
+| `incomplete` | `true` when the response was not sent to its end: the client went away, or nginx gave the request up. The status is still that of the response that was begun |
 | `uct`, `uht` | Time it took to connect to the upstream, and until the upstream had sent its response header, in milliseconds |
 | `bytes`, `req_len` | Response body size sent, request size |
 
@@ -191,10 +192,15 @@ empty. The reserved values a client puts into its lists at random
 sorted or hashed: Torii derives what it needs from this.
 
 The value is that of the handshake of the connection, the same for every request made over
-it. It is empty for a request without TLS and in an nginx built without the SSL module. HTTP/3
-is not tested, and the value may be empty there. When something in front of nginx ends TLS (a CDN, a
+it. It is empty for a request without TLS and in an nginx built without the SSL module. When something in front of nginx ends TLS (a CDN, a
 load balancer), the ClientHello is that of the CDN and says nothing about the client: do not
 let Torii judge clients by it on such a site.
+
+For an HTTP/3 request the value is that of the QUIC handshake, which offers `h3` and other
+extensions than the same client does over TCP. It is there when nginx uses the QUIC API of the
+SSL library (seen with nginx 1.30.7 built with OpenSSL 3.5.4). With the compatibility layer
+nginx uses for an OpenSSL without that API (OpenSSL before 3.5, and nginx versions that do not
+know the API), nginx reads the handshake itself and the value is empty.
 
 The module reads the ClientHello in the message callback of the SSL library
 (`SSL_CTX_set_msg_callback`). Another module that sets this callback for the same servers

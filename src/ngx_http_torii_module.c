@@ -917,6 +917,7 @@ ngx_http_torii_report(ngx_http_request_t *r, ngx_http_torii_loc_conf_t *tlcf,
                          NGX_HTTP_TORII_REPORT_SHORT_MAX);
 
     size = sizeof("{\"v\":1,\"ts\":,\"status\":,\"conn_reqs\":,\"lang\":true"
+                  ",\"incomplete\":true"
                   ",\"rt\":,\"urt\":,\"uct\":,\"uht\":,\"ustatus\":,\"bytes\":"
                   ",\"req_len\":}")
            + 2 * NGX_TIME_T_LEN + 8 * NGX_INT_T_LEN + 2 * NGX_OFF_T_LEN;
@@ -970,6 +971,17 @@ ngx_http_torii_report(ngx_http_request_t *r, ngx_http_torii_loc_conf_t *tlcf,
 
     if (lang) {
         p = ngx_cpymem(p, ",\"lang\":true", sizeof(",\"lang\":true") - 1);
+    }
+
+    /*
+     * what $request_completion tells: the client went away, or the request
+     * was given up, before the whole response was sent; the status is then
+     * still the one of the response that was begun
+     */
+
+    if (!r->request_complete) {
+        p = ngx_cpymem(p, ",\"incomplete\":true",
+                       sizeof(",\"incomplete\":true") - 1);
     }
 
     rt = (ngx_msec_int_t) ((tp->sec - r->start_sec) * 1000
@@ -1270,8 +1282,13 @@ ngx_http_torii_tls_variable(ngx_http_request_t *r,
  * The ClientHello is read in the message callback of OpenSSL, set for the
  * SSL context of every server.  The ClientHello callback would be the place
  * made for it, but nginx 1.29 and newer use it themselves, and it cannot be
- * shared.  nginx sets a message callback of its own only for QUIC connections
- * on OpenSSL builds without a QUIC API; of those nothing is known here.
+ * shared.
+ *
+ * For an HTTP/3 connection this works when nginx uses the QUIC API of the SSL
+ * library (seen with OpenSSL 3.5.4 and nginx 1.30.7).  With its
+ * compatibility layer for an OpenSSL without that API, nginx sets a message
+ * callback of its own for the connection, which takes the place of this one:
+ * nothing is known of the ClientHello then, and $torii_tls is empty.
  */
 
 static ngx_int_t
