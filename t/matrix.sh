@@ -5,14 +5,16 @@
 #
 # A TARGET is an nginx version ("1.26.3"), an OpenResty version ("openresty-1.27.1.2"), either
 # one followed by "+dynamic" to build the module as a shared object ("1.26.3+dynamic").
+# An nginx version followed by "+nossl" is built without the SSL module ("1.30.7+nossl"),
+# where the module must still build and $torii_tls is empty.
 # Without targets the default list below is used.
 #
 # BUILD_ONLY=1 needs no Server Torii: each target is built and "nginx -t" loads a configuration
 # that uses the module's directives, and the integration test is not run. CI does this.
 #
 # Sources are downloaded from nginx.org and openresty.org; builds are kept in CACHE
-# (default ~/.cache/ngx-torii-matrix) and reused. Needs a C toolchain, zlib and PCRE2
-# headers, curl, perl (OpenResty) and Go (to build Server Torii).
+# (default ~/.cache/ngx-torii-matrix) and reused. Needs a C toolchain, zlib, PCRE2 and
+# OpenSSL headers, curl, perl (OpenResty) and Go (to build Server Torii).
 #
 # nginx before 1.21.5 needs the original PCRE library, which current distributions no longer
 # ship headers for; its source is downloaded and built into nginx for those versions.
@@ -24,7 +26,7 @@ BUILD_ONLY=${BUILD_ONLY:-0}
 CACHE=${CACHE:-$HOME/.cache/ngx-torii-matrix}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 2)}
 PCRE1_VERSION=8.45
-DEFAULT_TARGETS=(1.14.2 1.16.1 1.18.0 1.20.2 1.22.1 1.24.0 1.26.3 1.28.0 1.30.7 1.30.7+dynamic openresty-1.27.1.2)
+DEFAULT_TARGETS=(1.14.2 1.16.1 1.18.0 1.20.2 1.22.1 1.24.0 1.26.3 1.28.0 1.30.7 1.30.7+dynamic 1.30.7+nossl openresty-1.27.1.2)
 
 targets=("$@")
 (( ${#targets[@]} > 0 )) || targets=("${DEFAULT_TARGETS[@]}")
@@ -56,8 +58,9 @@ fetch() {
 
 # build TARGET: prints nothing; sets NGINX_BIN and MODULE_SO.
 build() {
-    local target=$1 spec dynamic=0 flavor=nginx version dir src add log
+    local target=$1 spec dynamic=0 ssl=1 flavor=nginx version dir src add log
     spec=$target
+    if [[ "$spec" == *+nossl ]]; then ssl=0 spec=${spec%+nossl}; fi
     if [[ "$spec" == *+dynamic ]]; then dynamic=1 spec=${spec%+dynamic}; fi
     if [[ "$spec" == openresty-* ]]; then flavor=openresty version=${spec#openresty-}; else version=$spec; fi
     dir="$CACHE/build/$target"
@@ -86,6 +89,8 @@ build() {
     (( dynamic == 0 )) || add=--add-dynamic-module
     # --with-debug: the test counts the module's debug log lines.
     local -a args=(--prefix="$dir/prefix" --with-debug --with-http_v2_module "$add=$ROOT")
+    # OpenResty always has the SSL module.
+    (( ssl == 0 )) || args+=(--with-http_ssl_module)
     if [[ "$flavor" == nginx ]]; then
         args+=(--without-http_gzip_module)
         if ! version_ge "$version" 1.21.5; then

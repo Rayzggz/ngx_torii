@@ -4,7 +4,8 @@
 #   NGINX_BIN=/path/to/sbin/nginx TORII_BIN=/path/to/server_torii \
 #   TORII_SRC=/path/to/server_torii-checkout bash t/run.sh
 #
-# nginx must be built with --with-debug and --with-http_v2_module.
+# nginx must be built with --with-debug and --with-http_v2_module. The tests of $torii_tls
+# need --with-http_ssl_module as well and are skipped without it.
 # TORII_SRC provides the test rules and pages (tests/e2e/fixtures) and the GeoIP
 # database. Everything runs on loopback out of a temporary directory.
 #
@@ -40,6 +41,10 @@ P_GONE=$((BASE_PORT + 12))    # request reports sent to a socket nobody listens 
 STALL_PORT=$((BASE_PORT + 13)) # a Torii that stops in the middle of its response
 P_STALL=$((BASE_PORT + 14))   # checks sent to it, torii_on_error pass
 P_NOEP=$((BASE_PORT + 15))    # "torii on" without the endpoint locations
+SEEN_PORT=$((BASE_PORT + 16)) # a Torii that records the headers of every check
+P_SEEN=$((BASE_PORT + 17))    # checks sent to it
+P_TLS=$((BASE_PORT + 18))     # the same over TLS, HTTP/1.1 and HTTP/2
+P_BROWSER=$((BASE_PORT + 19)) # TLS, with the browser integrity check of Torii switched on
 
 RUN=$(mktemp -d "${TMPDIR:-/tmp}/ngx-torii-t.XXXXXXXX")
 ASSERTIONS=0
@@ -144,6 +149,34 @@ while True:
 PY
 PIDS+=("$!")
 
+# A Torii that lets every request pass and writes the headers of the check, one JSON object
+# per line with the names in lower case.
+python3 - "$SEEN_PORT" "$RUN/seen.jsonl" <<'PY' &
+import json, socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(64)
+out = open(sys.argv[2], "a")
+while True:
+    c, _ = s.accept()
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = c.recv(65535)
+        if not chunk:
+            break
+        data += chunk
+    headers = {}
+    for line in data.split(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    out.write(json.dumps(headers) + "\n")
+    out.flush()
+    c.sendall(b"HTTP/1.1 200 OK\r\nTorii-Decision: pass\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    c.close()
+PY
+PIDS+=("$!")
+
 # ----------------------------------------------------------------------- nginx
 # "nginx version: nginx/1.26.3" or "nginx version: openresty/1.27.1.2".
 NGINX_VERSION=$("$NGINX_BIN" -v 2>&1 | sed -n 's|^nginx version: [^/]*/\([0-9.]*\).*|\1|p')
@@ -166,9 +199,12 @@ if version_ge "$NGINX_VERSION" 1.25.1; then
 else
     H2_LISTEN=' http2' H2_DIRECTIVE=''
 fi
+# $torii_tls needs the SSL module; without it the variable exists and is empty.
+HAVE_SSL=0 TLS_SERVER='' NO_SSL=''
+if "$NGINX_BIN" -V 2>&1 | grep -q -- '--with-http_ssl_module'; then HAVE_SSL=1; else NO_SSL=', no SSL module'; fi
 LOAD_MODULE=''
 [[ -z "$NGX_TORII_MODULE" ]] || LOAD_MODULE="load_module $NGX_TORII_MODULE;"
-echo "nginx $NGINX_VERSION${NGX_TORII_MODULE:+, dynamic module}"
+echo "nginx $NGINX_VERSION${NGX_TORII_MODULE:+, dynamic module}$NO_SSL"
 
 mkdir -p "$RUN/nginx/logs" "$RUN/nginx/conf/torii"
 cp "$ROOT/conf/"*.conf "$RUN/nginx/conf/torii/"
@@ -179,6 +215,35 @@ sed 's/subrequest_output_buffer_size 64k/subrequest_output_buffer_size 1k/' \
     "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/small.conf"
 sed 's/torii_backend/torii_stall/; s/proxy_read_timeout 5s/proxy_read_timeout 1s/' \
     "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/stall.conf"
+sed 's/torii_backend/torii_seen/' "$ROOT/conf/torii_endpoints.conf" > "$RUN/nginx/conf/torii/seen.conf"
+
+if (( HAVE_SSL )); then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=torii.test \
+        -keyout "$RUN/nginx/conf/tls.key" -out "$RUN/nginx/conf/tls.crt" 2> /dev/null || fail 'cannot make a certificate'
+    TLS_SERVER="
+    server {
+        listen 127.0.0.1:$P_TLS ssl$H2_LISTEN;
+        $H2_DIRECTIVE
+        ssl_certificate tls.crt;
+        ssl_certificate_key tls.key;
+        torii on;
+        torii_site shop;
+        include torii/seen.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+    }
+
+    server {
+        listen 127.0.0.1:$P_BROWSER ssl$H2_LISTEN;
+        $H2_DIRECTIVE
+        ssl_certificate tls.crt;
+        ssl_certificate_key tls.key;
+        torii on;
+        torii_site shop;
+        torii_features \"+browser_integrity\";
+        include torii/torii_endpoints.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+    }"
+fi
 
 cat > "$RUN/nginx/conf/nginx.conf" <<EOF
 $LOAD_MODULE
@@ -195,6 +260,7 @@ http {
     upstream torii_unix    { server unix:$SOCK; keepalive 8; }
     upstream torii_dead    { server 127.0.0.1:1; }
     upstream torii_stall   { server 127.0.0.1:$STALL_PORT; }
+    upstream torii_seen    { server 127.0.0.1:$SEEN_PORT; }
 
     torii_log syslog:server=unix:$LOGSOCK;
 
@@ -323,6 +389,15 @@ http {
         include torii/torii_endpoints.conf;
         location / { proxy_pass http://127.0.0.1:$P_APP; }
     }
+
+    server {
+        listen 127.0.0.1:$P_SEEN;
+        torii on;
+        torii_site shop;
+        include torii/seen.conf;
+        location / { proxy_pass http://127.0.0.1:$P_APP; }
+    }
+$TLS_SERVER
 }
 EOF
 "$NGINX_BIN" -p "$RUN/nginx" -c conf/nginx.conf -t 2> "$RUN/nginx-t.log" || { cat "$RUN/nginx-t.log" >&2; fail 'nginx -t'; }
@@ -442,6 +517,120 @@ else
     echo 'SKIP: curl has no HTTP/2 support'
 fi
 
+# ------------------------------------------------- what the check tells Torii
+# seen URI FILTER: the value jq extracts from the headers of the last check for URI.
+seen() { jq -r --arg uri "$1" 'select(.["torii-uri"] == $uri) | '"$2" "$RUN/seen.jsonl" | tail -n 1; }
+
+# The names of the request headers as the client sent them. A header the connector sets is
+# never the one the client sent, and an empty one is not sent at all.
+get "$P_SEEN" /order -A order-test -H 'X-b: 1' -H 'x-A: 2' -H 'Torii-TLS: forged' -H 'Torii-Scheme: forged'
+assert_eq "$CODE" 200 'recorded check status'
+assert_eq "$(seen /order '.["torii-header-order"]')" 'Host,User-Agent,Accept,X-b,x-A,Torii-TLS,Torii-Scheme' 'header order'
+assert_eq "$(seen /order '.["torii-scheme"]')" http 'scheme'
+assert_eq "$(seen /order '.["torii-proto"]')" HTTP/1.1 'protocol'
+assert_eq "$(seen /order '.["torii-tls"]')" null 'no TLS data without TLS, whatever the client claims'
+many=()
+for i in $(seq 70); do many+=(-H "X-H$i: 1"); done
+get "$P_SEEN" /many "${many[@]}"
+assert_eq "$(seen /many '.["torii-header-order"] | split(",") | length')" 64 'header order is cut at 64 names'
+
+if (( HAVE_SSL )); then
+    # tls URI FIELD: one of the eight fields of Torii-TLS, counted from 0.
+    tls() { seen "$1" '.["torii-tls"] | split("|") | .['"$2"']'; }
+
+    # A ClientHello whose content the client was told on the command line.
+    printf 'GET /tls12 HTTP/1.1\r\nHost: torii.test\r\nConnection: close\r\n\r\n' \
+        | timeout 10 openssl s_client -quiet -connect "127.0.0.1:$P_TLS" -servername torii.test -tls1_2 \
+            -cipher ECDHE-RSA-AES128-GCM-SHA256 -groups P-256 -sigalgs RSA+SHA256 -alpn http/1.1,torii-x \
+            > "$RUN/b" 2> /dev/null || true
+    assert_contains "$(cat "$RUN/b")" 'APP GET /tls12' 'request over TLS 1.2'
+    assert_eq "$(seen /tls12 '.["torii-tls"] | split("|") | length')" 8 'TLS fields'
+    assert_eq "$(tls /tls12 0)" 0303 'TLS legacy version'
+    assert_eq "$(tls /tls12 1 | cut -d, -f1)" c02f 'TLS cipher suites'
+    assert_contains ",$(tls /tls12 2)," ',0000,' 'TLS extensions: server name'
+    assert_contains ",$(tls /tls12 2)," ',0010,' 'TLS extensions: ALPN'
+    assert_eq "$(tls /tls12 3)" '' 'TLS supported versions, not sent by a TLS 1.2 client'
+    assert_eq "$(tls /tls12 4)" 0017 'TLS groups'
+    assert_eq "$(tls /tls12 6)" 0401 'TLS signature algorithms'
+    assert_eq "$(tls /tls12 7)" http/1.1,torii-x 'TLS ALPN protocols'
+    assert_eq "$(seen /tls12 '.["torii-scheme"]')" https 'scheme over TLS'
+
+    # Every request of a connection has the data of its handshake.
+    tcurl() {
+        curl --silent --show-error --noproxy '*' --max-time 10 --insecure \
+            --resolve "torii.test:$P_TLS:127.0.0.1" --resolve "torii.test:$P_BROWSER:127.0.0.1" "$@"
+    }
+    tcurl --http1.1 -o /dev/null "https://torii.test:$P_TLS/keep1" -o /dev/null "https://torii.test:$P_TLS/keep2" \
+        || fail 'transport error: TLS keepalive'
+    assert_contains ",$(tls /keep1 3)," ',0304,' 'TLS supported versions'
+    assert_eq "$(seen /keep2 '.["torii-tls"]')" "$(seen /keep1 '.["torii-tls"]')" 'TLS data on a kept connection'
+
+    if curl --version | grep -q HTTP2; then
+        tcurl --http2 -o /dev/null -A h2-test -H 'X-b: 1' -H 'x-A: 2' "https://torii.test:$P_TLS/h2" \
+            || fail 'transport error: HTTP/2 over TLS'
+        assert_eq "$(seen /h2 '.["torii-proto"]')" HTTP/2.0 'protocol over HTTP/2'
+        assert_eq "$(seen /h2 '.["torii-header-order"]')" 'user-agent,accept,x-b,x-a' 'header order over HTTP/2'
+        assert_eq "$(tls /h2 7 | cut -d, -f1)" h2 'TLS ALPN protocols of an HTTP/2 client'
+    fi
+
+    # Torii judges a client by these headers: one that calls itself Chrome is refused for what
+    # its request lacks, and when it sends every header Chrome sends, for its TLS handshake.
+    CHROME='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
+    browser() { CODE=$(tcurl -o "$RUN/b" -w '%{http_code}' "$@") || fail 'transport error: browser integrity'; }
+    browser "https://torii.test:$P_BROWSER/browser-none"
+    assert_eq "$CODE" 200 'a client that claims no browser is not judged'
+    browser -A "$CHROME" "https://torii.test:$P_BROWSER/browser-name"
+    assert_eq "$CODE" 403 'only the name of a browser'
+    browser -A "$CHROME" -H 'sec-ch-ua: "Chromium";v="135", "Not-A.Brand";v="8"' -H 'sec-ch-ua-platform: "Windows"' \
+        -H 'Accept: text/html,*/*;q=0.8' -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: navigate' -H 'Sec-Fetch-Dest: document' \
+        -H 'Accept-Encoding: gzip' -H 'Accept-Language: en' "https://torii.test:$P_BROWSER/browser-headers"
+    assert_eq "$CODE" 403 'the headers of a browser, the TLS handshake of curl'
+
+    # A handwritten ClientHello: reserved values (RFC 8701) are all written as 0a0a, an
+    # extension sent twice counts once, and characters that would break the format are
+    # replaced. The same message cut at every length must not be read past its end.
+    python3 - "$P_TLS" <<'PY'
+import socket, sys
+
+def vec(n, data): return len(data).to_bytes(n, "big") + data
+def u16(*values): return b"".join(v.to_bytes(2, "big") for v in values)
+def ext(kind, data): return u16(kind) + vec(2, data)
+
+extensions = (
+    ext(0x1a1a, b"")
+    + ext(0x0000, vec(2, b"\x00" + vec(2, b"torii.test")))
+    + ext(0x000a, vec(2, u16(0x2a2a, 0x001d, 0x0017)))
+    + ext(0x000b, vec(1, b"\x00\x01"))
+    + ext(0x000d, vec(2, u16(0x0403, 0x0804)))
+    + ext(0x0010, vec(2, vec(1, b"h2") + vec(1, b"a,b|c")))
+    + ext(0x002b, vec(1, u16(0x3a3a, 0x0304, 0x0303)))
+    + ext(0x000a, vec(2, u16(0x0018))))
+hello = (b"\x03\x03" + bytes(32) + vec(1, b"") + vec(2, u16(0x4a4a, 0x1301, 0xc02f))
+         + vec(1, b"\x00") + vec(2, extensions))
+
+def send(body):
+    message = b"\x01" + len(body).to_bytes(3, "big") + body
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+    try:
+        s.sendall(b"\x16\x03\x01" + len(message).to_bytes(2, "big") + message)
+        s.recv(4096)
+    except OSError:
+        pass
+    s.close()
+
+send(hello)
+for cut in range(len(hello)):
+    send(hello[:cut])
+PY
+    sleep 0.3
+    ASSERTIONS=$((ASSERTIONS + 2))
+    grep -qF 'torii tls: "0303|0a0a,1301,c02f|0a0a,0000,000a,000b,000d,0010,002b,000a|0a0a,0304,0303|0a0a,001d,0017|00,01|0403,0804|h2,a?b?c"' \
+        "$RUN/nginx/logs/error.log" || fail 'a handwritten ClientHello is not read as expected'
+    grep -q 'torii tls: malformed ClientHello' "$RUN/nginx/logs/error.log" || fail 'a cut ClientHello is not refused'
+else
+    echo "SKIP: nginx has no SSL module, \$torii_tls is not tested"
+fi
+
 # ------------------------------------------------------------- request reports
 # report N FILTER: the value jq extracts from the N-th captured report.
 report() { sed -n "${1}p" "$RUN/cap.jsonl" | jq -r "$2"; }
@@ -536,11 +725,17 @@ assert_contains "$LOG" '/blocked|403|block|Lists:url_block|shop' 'access log: bl
 assert_contains "$LOG" '/challenge|503|challenge|Lists:url_captcha|shop' 'access log: challenge with reason'
 assert_contains "$LOG" '/neutral|503|error|-|no_such_site' 'access log: error'
 assert_contains "$LOG" '/redirected?marker=once|200|pass|-|shop' 'access log: decision survives the redirect'
+if (( HAVE_SSL )); then
+    assert_contains "$LOG" '/browser-none|200|pass|-|shop' 'access log: no browser claimed'
+    assert_contains "$LOG" '/browser-name|403|block|BrowserIntegrity:missing_headers|shop' 'access log: browser integrity rule'
+    assert_contains "$LOG" '/browser-headers|403|block|BrowserIntegrity:tls|shop' 'access log: browser integrity by TLS'
+fi
 
 "$NGINX_BIN" -p "$RUN/nginx" -c conf/nginx.conf -s quit
 for _ in $(seq 50); do [[ -f "$RUN/nginx/logs/nginx.pid" ]] || break; sleep 0.1; done
 ASSERTIONS=$((ASSERTIONS + 1))
-if grep -v 'gone.sock\|connect() failed (2: No such file or directory)$' "$RUN/nginx/logs/error.log" \
+# nginx 1.22 and older log the handshakes the handwritten ClientHellos fail at the crit level.
+if grep -v 'gone.sock\|connect() failed (2: No such file or directory)$\|SSL_do_handshake() failed' "$RUN/nginx/logs/error.log" \
     | grep -E '\[(alert|emerg|crit)\]|AddressSanitizer|LeakSanitizer|runtime error' > "$RUN/bad.log"; then
     head -n 20 "$RUN/bad.log" >&2
     fail 'nginx logged an alert or a sanitizer report'

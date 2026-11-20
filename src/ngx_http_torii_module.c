@@ -36,6 +36,27 @@
 /* after a failed send, reports are skipped for this long */
 #define NGX_HTTP_TORII_REPORT_RETRY        1000
 
+/* $torii_header_order names at most this many headers, in this many bytes */
+#define NGX_HTTP_TORII_ORDER_NAMES_MAX     64
+#define NGX_HTTP_TORII_ORDER_MAX           1024
+
+/* how many values of each list of the ClientHello $torii_tls holds */
+#define NGX_HTTP_TORII_TLS_VERSIONS_MAX    8
+#define NGX_HTTP_TORII_TLS_CIPHERS_MAX     64
+#define NGX_HTTP_TORII_TLS_EXTENSIONS_MAX  64
+#define NGX_HTTP_TORII_TLS_GROUPS_MAX      32
+#define NGX_HTTP_TORII_TLS_FORMATS_MAX     8
+#define NGX_HTTP_TORII_TLS_SIGALGS_MAX     48
+#define NGX_HTTP_TORII_TLS_ALPN_MAX        64
+
+/* 5 bytes for a 16-bit value and its separator, 7 separators between fields */
+#define NGX_HTTP_TORII_TLS_MAX                                                \
+    (4 + 7                                                                    \
+     + 5 * (NGX_HTTP_TORII_TLS_VERSIONS_MAX + NGX_HTTP_TORII_TLS_CIPHERS_MAX  \
+            + NGX_HTTP_TORII_TLS_EXTENSIONS_MAX                               \
+            + NGX_HTTP_TORII_TLS_GROUPS_MAX + NGX_HTTP_TORII_TLS_SIGALGS_MAX) \
+     + 3 * NGX_HTTP_TORII_TLS_FORMATS_MAX + NGX_HTTP_TORII_TLS_ALPN_MAX)
+
 /* the key of a report field is a string literal */
 #define ngx_http_torii_field(field, key, value, max)                          \
     ngx_http_torii_set_field(field, (u_char *) key, sizeof(key) - 1, value,   \
@@ -90,6 +111,17 @@ static ngx_int_t ngx_http_torii_conf_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_torii_result_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_torii_header_order_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_torii_tls_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+#if (NGX_HTTP_SSL)
+static ngx_int_t ngx_http_torii_tls_init(ngx_conf_t *cf);
+static void ngx_http_torii_tls_message(int write_p, int version,
+    int content_type, const void *buf, size_t len, SSL *ssl, void *arg);
+static u_char *ngx_http_torii_tls_client_hello(u_char *dst, const u_char *p,
+    size_t len);
+#endif
 static ngx_int_t ngx_http_torii_log_handler(ngx_http_request_t *r);
 static u_char *ngx_http_torii_report(ngx_http_request_t *r,
     ngx_http_torii_loc_conf_t *tlcf, size_t *len);
@@ -194,6 +226,14 @@ static ngx_str_t  ngx_http_torii_site_name = ngx_string("torii_site");
 static ngx_str_t  ngx_http_torii_features_name = ngx_string("torii_features");
 static ngx_str_t  ngx_http_torii_decision_name = ngx_string("torii_decision");
 static ngx_str_t  ngx_http_torii_reason_name = ngx_string("torii_reason");
+static ngx_str_t  ngx_http_torii_header_order_name =
+    ngx_string("torii_header_order");
+static ngx_str_t  ngx_http_torii_tls_name = ngx_string("torii_tls");
+
+#if (NGX_HTTP_SSL)
+/* where a connection keeps what its ClientHello held */
+static int  ngx_http_torii_tls_index = -1;
+#endif
 
 static ngx_str_t  ngx_http_torii_decision_header = ngx_string("Torii-Decision");
 static ngx_str_t  ngx_http_torii_reason_header = ngx_string("Torii-Reason");
@@ -1080,10 +1120,541 @@ ngx_http_torii_result_variable(ngx_http_request_t *r,
 }
 
 
+/*
+ * $torii_header_order: the names of the request headers, in the order and
+ * the case the client sent them, separated by commas.  Browsers send their
+ * headers in a fixed order that the HTTP libraries of scripts do not follow,
+ * and Torii cannot see the order in the check: its HTTP server keeps headers
+ * in a map.
+ *
+ * In HTTP/2 and HTTP/3 the names are in lower case and the pseudo headers are
+ * not listed.  nginx makes a "host" header out of ":authority" there, at a
+ * place that depends on its version, so "host" is left out; and it puts the
+ * cookies into one "cookie" header at the end.
+ */
+
+static ngx_int_t
+ngx_http_torii_header_order_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    u_char            ch, *p, *buf;
+    ngx_uint_t        i, j, n;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    r = r->main;
+
+    buf = ngx_pnalloc(r->pool, NGX_HTTP_TORII_ORDER_MAX);
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = buf;
+    n = 0;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (r->http_version >= NGX_HTTP_VERSION_20
+            && h[i].key.len == 4
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "host", 4) == 0)
+        {
+            continue;
+        }
+
+        /* a name that does not fit ends the list: a gap would misstate it */
+
+        if (n == NGX_HTTP_TORII_ORDER_NAMES_MAX
+            || (size_t) (buf + NGX_HTTP_TORII_ORDER_MAX - p)
+               < h[i].key.len + 1)
+        {
+            break;
+        }
+
+        if (n++) {
+            *p++ = ',';
+        }
+
+        /* with "ignore_invalid_headers off" a name may hold any character */
+
+        for (j = 0; j < h[i].key.len; j++) {
+            ch = h[i].key.data[j];
+            *p++ = (ch <= 0x20 || ch >= 0x7f || ch == ',') ? '?' : ch;
+        }
+    }
+
+    if (n == 0) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->len = p - buf;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    v->data = buf;
+
+    return NGX_OK;
+}
+
+
+/*
+ * $torii_tls: what the ClientHello of the connection held, see
+ * ngx_http_torii_tls_client_hello().  It is empty when there is nothing to
+ * tell: a request without TLS, an nginx without the SSL module, a connection
+ * whose ClientHello this module did not see.
+ */
+
+static ngx_int_t
+ngx_http_torii_tls_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+#if (NGX_HTTP_SSL)
+
+    ngx_str_t         *hello;
+    ngx_connection_t  *c;
+
+    c = r->connection;
+
+    if (c->ssl && ngx_http_torii_tls_index != -1) {
+        hello = SSL_get_ex_data(c->ssl->connection, ngx_http_torii_tls_index);
+
+        if (hello) {
+            v->len = hello->len;
+            v->valid = 1;
+            v->no_cacheable = 0;
+            v->not_found = 0;
+            v->data = hello->data;
+
+            return NGX_OK;
+        }
+    }
+
+#endif
+
+    v->not_found = 1;
+
+    return NGX_OK;
+}
+
+
+#if (NGX_HTTP_SSL)
+
+/*
+ * The ClientHello is read in the message callback of OpenSSL, set for the
+ * SSL context of every server.  The ClientHello callback would be the place
+ * made for it, but nginx 1.29 and newer use it themselves, and it cannot be
+ * shared.  nginx sets a message callback of its own only for QUIC connections
+ * on OpenSSL builds without a QUIC API; of those nothing is known here.
+ */
+
+static ngx_int_t
+ngx_http_torii_tls_init(ngx_conf_t *cf)
+{
+    ngx_uint_t                   s;
+    ngx_http_ssl_srv_conf_t     *sscf;
+    ngx_http_core_srv_conf_t   **cscfp;
+    ngx_http_core_main_conf_t   *cmcf;
+
+    if (ngx_http_torii_tls_index == -1) {
+        ngx_http_torii_tls_index = SSL_get_ex_new_index(0, NULL, NULL, NULL,
+                                                        NULL);
+        if (ngx_http_torii_tls_index == -1) {
+            ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                          "SSL_get_ex_new_index() failed");
+            return NGX_ERROR;
+        }
+    }
+
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    cscfp = cmcf->servers.elts;
+
+    for (s = 0; s < cmcf->servers.nelts; s++) {
+        sscf = cscfp[s]->ctx->srv_conf[ngx_http_ssl_module.ctx_index];
+
+        if (sscf == NULL || sscf->ssl.ctx == NULL) {
+            continue;
+        }
+
+        SSL_CTX_set_msg_callback(sscf->ssl.ctx, ngx_http_torii_tls_message);
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_torii_tls_message(int write_p, int version, int content_type,
+    const void *buf, size_t len, SSL *ssl, void *arg)
+{
+    u_char            *last, text[NGX_HTTP_TORII_TLS_MAX];
+    ngx_str_t         *hello;
+    const u_char      *p;
+    ngx_connection_t  *c;
+
+    p = buf;
+
+    /* called for every record and message of the connection: leave early */
+
+    if (write_p || content_type != SSL3_RT_HANDSHAKE || len < 4
+        || p[0] != SSL3_MT_CLIENT_HELLO)
+    {
+        return;
+    }
+
+    /* the first ClientHello counts: a second one answers HelloRetryRequest */
+
+    if (SSL_get_ex_data(ssl, ngx_http_torii_tls_index) != NULL) {
+        return;
+    }
+
+    c = ngx_ssl_get_connection(ssl);
+    if (c == NULL) {
+        return;
+    }
+
+    /* the message follows its type and a length of three bytes */
+
+    last = ngx_http_torii_tls_client_hello(text, p + 4, len - 4);
+
+    if (last == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "torii tls: malformed ClientHello");
+        return;
+    }
+
+    hello = ngx_palloc(c->pool, sizeof(ngx_str_t) + (last - text));
+    if (hello == NULL) {
+        return;
+    }
+
+    hello->len = last - text;
+    hello->data = (u_char *) hello + sizeof(ngx_str_t);
+    ngx_memcpy(hello->data, text, hello->len);
+
+    if (SSL_set_ex_data(ssl, ngx_http_torii_tls_index, hello) == 0) {
+        return;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "torii tls: \"%V\"", hello);
+}
+
+
+/* reads a vector that follows its length of one or two bytes */
+
+static ngx_inline ngx_int_t
+ngx_http_torii_tls_vector(const u_char **pos, const u_char *last,
+    ngx_uint_t prefix, const u_char **data, size_t *len)
+{
+    size_t         n;
+    const u_char  *p;
+
+    p = *pos;
+
+    if ((size_t) (last - p) < prefix) {
+        return NGX_ERROR;
+    }
+
+    n = (prefix == 1) ? p[0] : ((size_t) p[0] << 8) + p[1];
+    p += prefix;
+
+    if ((size_t) (last - p) < n) {
+        return NGX_ERROR;
+    }
+
+    *data = p;
+    *len = n;
+    *pos = p + n;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Writes a 16-bit value as four hexadecimal digits.  A client that follows
+ * RFC 8701 puts values picked at random out of sixteen reserved ones into its
+ * lists; they are all written as 0a0a, so that the same client always reads
+ * the same while it still shows that it does so, and where.
+ */
+
+static ngx_inline u_char *
+ngx_http_torii_tls_value(u_char *dst, ngx_uint_t value)
+{
+    static u_char  hex[] = "0123456789abcdef";
+
+    if ((value & 0x0f0f) == 0x0a0a && (value >> 8) == (value & 0xff)) {
+        value = 0x0a0a;
+    }
+
+    *dst++ = hex[(value >> 12) & 0xf];
+    *dst++ = hex[(value >> 8) & 0xf];
+    *dst++ = hex[(value >> 4) & 0xf];
+    *dst++ = hex[value & 0xf];
+
+    return dst;
+}
+
+
+/* writes at most max values of a list of 16-bit values, separated by commas */
+
+static u_char *
+ngx_http_torii_tls_values(u_char *dst, const u_char *data, size_t len,
+    ngx_uint_t max)
+{
+    ngx_uint_t  n;
+
+    for (n = 0; len >= 2 && n < max; n++) {
+        if (n) {
+            *dst++ = ',';
+        }
+
+        dst = ngx_http_torii_tls_value(dst, ((ngx_uint_t) data[0] << 8)
+                                            + data[1]);
+        data += 2;
+        len -= 2;
+    }
+
+    return dst;
+}
+
+
+/*
+ * Writes what a ClientHello holds as eight fields separated by "|":
+ *
+ *     legacy_version | cipher suites | extension types | supported versions
+ *     | supported groups | EC point formats | signature algorithms | ALPN
+ *
+ * Every field but the first is a list separated by commas, in the order of
+ * the client; a field the client did not send is empty.  Values are in
+ * hexadecimal as they are on the wire, ALPN protocols are names.  Nothing is
+ * sorted or hashed: that is left to Torii, which can then derive whatever
+ * fingerprint it wants from the same data.
+ *
+ * The lists are cut at the limits NGX_HTTP_TORII_TLS_MAX is made of, so dst
+ * needs that many bytes.  Returns NULL for a message that is not a
+ * ClientHello; OpenSSL refuses such a handshake a moment later.
+ */
+
+static u_char *
+ngx_http_torii_tls_client_hello(u_char *dst, const u_char *p, size_t len)
+{
+    u_char         ch, *start;
+    size_t         n, size[5];
+    ngx_uint_t     i, type, count;
+    const u_char  *last, *end, *data, *ext[5];
+
+    /* the extensions that have a field of their own, in the order above */
+
+    static ngx_uint_t  types[] = {
+        0x002b,     /* supported_versions */
+        0x000a,     /* supported_groups */
+        0x000b,     /* ec_point_formats */
+        0x000d,     /* signature_algorithms */
+        0x0010      /* application_layer_protocol_negotiation */
+    };
+
+    last = p + len;
+
+    for (i = 0; i < 5; i++) {
+        ext[i] = NULL;
+        size[i] = 0;
+    }
+
+    /* legacy_version and random */
+
+    if (len < 34) {
+        return NULL;
+    }
+
+    dst = ngx_http_torii_tls_value(dst, ((ngx_uint_t) p[0] << 8) + p[1]);
+    p += 34;
+
+    /* legacy_session_id */
+
+    if (ngx_http_torii_tls_vector(&p, last, 1, &data, &n) != NGX_OK) {
+        return NULL;
+    }
+
+    if (ngx_http_torii_tls_vector(&p, last, 2, &data, &n) != NGX_OK) {
+        return NULL;
+    }
+
+    *dst++ = '|';
+    dst = ngx_http_torii_tls_values(dst, data, n,
+                                    NGX_HTTP_TORII_TLS_CIPHERS_MAX);
+
+    /* legacy_compression_methods */
+
+    if (ngx_http_torii_tls_vector(&p, last, 1, &data, &n) != NGX_OK) {
+        return NULL;
+    }
+
+    *dst++ = '|';
+
+    /* a ClientHello may end here, without extensions */
+
+    if (p < last) {
+        if (ngx_http_torii_tls_vector(&p, last, 2, &data, &n) != NGX_OK) {
+            return NULL;
+        }
+
+        p = data;
+        end = data + n;
+        count = 0;
+
+        while (p < end) {
+            if (end - p < 2) {
+                return NULL;
+            }
+
+            type = ((ngx_uint_t) p[0] << 8) + p[1];
+            p += 2;
+
+            if (ngx_http_torii_tls_vector(&p, end, 2, &data, &n) != NGX_OK) {
+                return NULL;
+            }
+
+            if (count < NGX_HTTP_TORII_TLS_EXTENSIONS_MAX) {
+                if (count++) {
+                    *dst++ = ',';
+                }
+
+                dst = ngx_http_torii_tls_value(dst, type);
+            }
+
+            for (i = 0; i < 5; i++) {
+                if (type == types[i] && ext[i] == NULL) {
+                    ext[i] = data;
+                    size[i] = n;
+                }
+            }
+        }
+    }
+
+    /* a list that is malformed in itself leaves its field empty */
+
+    for (i = 0; i < 5; i++) {
+        *dst++ = '|';
+
+        if (ext[i] == NULL) {
+            continue;
+        }
+
+        p = ext[i];
+        end = p + size[i];
+
+        switch (i) {
+
+        case 0:
+            if (ngx_http_torii_tls_vector(&p, end, 1, &data, &n) == NGX_OK) {
+                dst = ngx_http_torii_tls_values(dst, data, n,
+                                             NGX_HTTP_TORII_TLS_VERSIONS_MAX);
+            }
+
+            break;
+
+        case 1:
+            if (ngx_http_torii_tls_vector(&p, end, 2, &data, &n) == NGX_OK) {
+                dst = ngx_http_torii_tls_values(dst, data, n,
+                                               NGX_HTTP_TORII_TLS_GROUPS_MAX);
+            }
+
+            break;
+
+        case 2:
+            if (ngx_http_torii_tls_vector(&p, end, 1, &data, &n) == NGX_OK) {
+                n = ngx_min(n, NGX_HTTP_TORII_TLS_FORMATS_MAX);
+
+                /* these are single bytes */
+
+                for (count = 0; count < n; count++) {
+                    if (count) {
+                        *dst++ = ',';
+                    }
+
+                    dst = ngx_hex_dump(dst, (u_char *) &data[count], 1);
+                }
+            }
+
+            break;
+
+        case 3:
+            if (ngx_http_torii_tls_vector(&p, end, 2, &data, &n) == NGX_OK) {
+                dst = ngx_http_torii_tls_values(dst, data, n,
+                                              NGX_HTTP_TORII_TLS_SIGALGS_MAX);
+            }
+
+            break;
+
+        default:
+            if (ngx_http_torii_tls_vector(&p, end, 2, &data, &n) != NGX_OK) {
+                break;
+            }
+
+            p = data;
+            end = data + n;
+            start = dst;
+
+            /* a name that does not fit ends the list */
+
+            while (ngx_http_torii_tls_vector(&p, end, 1, &data, &n) == NGX_OK
+                   && (size_t) (dst - start) + n + 1
+                      <= NGX_HTTP_TORII_TLS_ALPN_MAX)
+            {
+                if (dst != start) {
+                    *dst++ = ',';
+                }
+
+                while (n--) {
+                    ch = *data++;
+                    *dst++ = (ch <= 0x20 || ch >= 0x7f || ch == ','
+                              || ch == '|')
+                             ? '?' : ch;
+                }
+            }
+
+            break;
+        }
+    }
+
+    return dst;
+}
+
+#endif
+
+
 static ngx_int_t
 ngx_http_torii_add_variables(ngx_conf_t *cf)
 {
     ngx_http_variable_t  *var;
+
+    var = ngx_http_add_variable(cf, &ngx_http_torii_header_order_name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_torii_header_order_variable;
+
+    /* declared also without the SSL module, where it is always empty */
+
+    var = ngx_http_add_variable(cf, &ngx_http_torii_tls_name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_torii_tls_variable;
 
     var = ngx_http_add_variable(cf, &ngx_http_torii_site_name,
                                 NGX_HTTP_VAR_NOCACHEABLE);
@@ -1222,6 +1793,14 @@ ngx_http_torii_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_torii_log_handler;
+
+#if (NGX_HTTP_SSL)
+
+    if (ngx_http_torii_tls_init(cf) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+#endif
 
     return NGX_OK;
 }

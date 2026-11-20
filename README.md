@@ -16,7 +16,8 @@ This version speaks connector protocol v1 and is **not compatible** with the
 - nginx 1.13.10 or newer (the module keeps the response of the check in memory,
   which needs `subrequest_output_buffer_size`), or an OpenResty based on one.
   Tested with nginx 1.14.2, 1.16.1, 1.18.0, 1.20.2, 1.22.1, 1.24.0, 1.26.3, 1.28.0
-  and 1.30.7, and with OpenResty 1.27.1.2, built into nginx and as a dynamic module.
+  and 1.30.7, and with OpenResty 1.27.1.2, built into nginx and as a dynamic module, with
+  the SSL module and without.
 - A server_torii that serves `/v1/check` and `/v1/public/`.
 
 ## Build
@@ -25,6 +26,10 @@ This version speaks connector protocol v1 and is **not compatible** with the
 ./configure --add-module=/path/to/ngx_torii            # static
 ./configure --add-dynamic-module=/path/to/ngx_torii    # dynamic: ngx_http_torii_module.so
 ```
+
+The SSL module (`--with-http_ssl_module`) is optional. Without it the module builds and works
+the same, and `$torii_tls` is always empty. A dynamic module must be built with the same choice
+as the nginx that loads it: one built with the SSL module does not load into an nginx without.
 
 ## Configuration
 
@@ -134,10 +139,65 @@ All directives are valid in `http`, `server` and `location`.
 | `$torii_decision` | `pass`, `block`, `challenge`, `rate_limit`, or `error` when Torii gave no decision. Empty when the request was not checked. A challenge is the CAPTCHA page of the site, or a redirect to its external provider. |
 | `$torii_reason` | The check behind the decision, with the list or custom rule that decided where there is one: `Lists:url_block`, `CustomRules:block-wp-scan`, `HTTPFlood`. For a challenge it is the check whose rule asked for it, or `Challenge` when the site challenges every client. |
 | `$torii_site`, `$torii_features` | The values configured for the location of the request. |
+| `$torii_header_order` | The names of the request headers in the order the client sent them. See *What the check tells Torii about the client*. |
+| `$torii_tls` | What the TLS ClientHello of the connection held; empty without TLS. See the same section. |
 
 ```nginx
 log_format torii '$remote_addr "$request" $status $torii_decision $torii_reason';
 ```
+
+## What the check tells Torii about the client
+
+Besides the headers of the client request, the check carries four headers that describe how
+the client reached nginx. Torii uses them to tell browsers from clients that only claim to be
+one. They are set in `torii_params.conf`; a header whose value is empty is not sent, and a
+header of one of these names that the client sent itself never reaches Torii.
+
+| Header | Value |
+| --- | --- |
+| `Torii-Scheme` | `http` or `https` |
+| `Torii-Proto` | `HTTP/1.1`, `HTTP/2.0`, `HTTP/3.0` |
+| `Torii-Header-Order` | `$torii_header_order` |
+| `Torii-TLS` | `$torii_tls` |
+
+`$torii_header_order` is the names of the request headers, separated by commas, in the order
+and the case the client sent them: `Host,User-Agent,Accept,Accept-Encoding`. At most 64 names
+and 1024 bytes are listed. In HTTP/2 and HTTP/3 the names are in lower case, pseudo headers and
+`host` are not listed, and `cookie` is always last, because nginx merges the cookie headers
+there.
+
+`$torii_tls` is the content of the ClientHello, as eight fields separated by `|`:
+
+```
+0303|1301,1302,c02b|0000,0017,000a,002b|0304,0303|001d,0017|00|0403,0804|h2,http/1.1
+```
+
+| # | Field |
+| --- | --- |
+| 1 | `legacy_version` |
+| 2 | Cipher suites |
+| 3 | Extension types |
+| 4 | Supported versions |
+| 5 | Supported groups |
+| 6 | EC point formats |
+| 7 | Signature algorithms |
+| 8 | ALPN protocols |
+
+Every field but the first is a list separated by commas, in the order of the client. Values
+are hexadecimal as on the wire; ALPN protocols are names. A field the client did not send is
+empty. The reserved values a client puts into its lists at random
+([RFC 8701](https://www.rfc-editor.org/rfc/rfc8701)) are all written as `0a0a`. Nothing is
+sorted or hashed: Torii derives what it needs from this.
+
+The value is that of the handshake of the connection, the same for every request made over
+it. It is empty for a request without TLS and in an nginx built without the SSL module. HTTP/3
+is not tested, and the value may be empty there. When something in front of nginx ends TLS (a CDN, a
+load balancer), the ClientHello is that of the CDN and says nothing about the client: do not
+let Torii judge clients by it on such a site.
+
+The module reads the ClientHello in the message callback of the SSL library
+(`SSL_CTX_set_msg_callback`). Another module that sets this callback for the same servers
+takes its place, or loses its own.
 
 ## Behavior notes
 
@@ -162,7 +222,8 @@ log_format torii '$remote_addr "$request" $status $torii_decision $torii_reason'
 
 Request headers sent to Torii (see `conf/torii_params.conf`): `Torii-Site`,
 `Torii-Client-IP`, `Torii-Host`, `Torii-URI`, `Torii-Method`, `Torii-Features`,
-plus the headers of the client request.
+`Torii-Scheme`, `Torii-Proto`, `Torii-Header-Order`, `Torii-TLS`, plus the headers of the
+client request.
 
 Response of `/v1/check`:
 
@@ -181,7 +242,8 @@ TORII_SRC=/path/to/server_torii-checkout bash t/run.sh
 ```
 
 nginx must be built with `--with-debug` and `--with-http_v2_module`; for a dynamic build
-also set `NGX_TORII_MODULE=/path/to/ngx_http_torii_module.so`.
+also set `NGX_TORII_MODULE=/path/to/ngx_http_torii_module.so`. The tests of `$torii_tls` run
+when nginx has the SSL module and are skipped otherwise.
 
 `t/matrix.sh` downloads and builds a list of nginx and OpenResty versions with the module
 and runs that test against each:
@@ -191,10 +253,15 @@ TORII_SRC=/path/to/server_torii-checkout bash t/matrix.sh                 # the 
 TORII_SRC=/path/to/server_torii-checkout bash t/matrix.sh 1.26.3 1.28.0+dynamic openresty-1.27.1.2
 ```
 
+Every target is built with the SSL module, except an nginx version followed by `+nossl`.
+
 The test covers request reports (their content, delivery over a Unix socket, locations that are
 neither checked nor logged, an unreachable socket, and a block made by Torii's traffic analysis
 from them), checks over TCP and a Unix socket, the pages and cookies of each
 decision, HEAD and POST, keepalive, HTTP/2, `torii off`, `torii_features`,
 `torii_on_error`, an unreachable Torii, an oversized or incomplete response, internal
-redirects and the log variables. Running it against an nginx built with
+redirects, the log variables, and what the check tells Torii about the client: the header
+order, and the ClientHello of a TLS 1.2, a TLS 1.3 and an HTTP/2 client and of a handwritten
+one, also cut short at every length; and that Torii's browser integrity check refuses a client
+by them. Running it against an nginx built with
 AddressSanitizer also checks the module for memory errors.

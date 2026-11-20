@@ -33,7 +33,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # nginx versions, "+dynamic" for the module as a shared object, and OpenResty.
+        # nginx versions, "+dynamic" for the module as a shared object, "+nossl" for an nginx
+        # without the SSL module, and OpenResty.
         # t/matrix.sh explains the format.
         target:
           - "1.14.2"
@@ -46,12 +47,13 @@ jobs:
           - "1.28.0"
           - "1.30.7"
           - "1.30.7+dynamic"
+          - "1.30.7+nossl"
           - "openresty-1.27.1.2"
     steps:
       - uses: actions/checkout@v5
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libpcre2-dev zlib1g-dev perl curl jq python3
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libpcre2-dev zlib1g-dev libssl-dev openssl perl curl jq python3
 
       - name: Build nginx with the module
         if: ${{ !inputs.torii_ref }}
