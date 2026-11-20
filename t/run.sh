@@ -531,6 +531,7 @@ assert_eq "$CODE" 200 'recorded check status'
 assert_eq "$(seen /order '.["torii-header-order"]')" 'Host,User-Agent,Accept,X-b,x-A,Torii-TLS,Torii-Scheme' 'header order'
 assert_eq "$(seen /order '.["torii-scheme"]')" http 'scheme'
 assert_eq "$(seen /order '.["torii-proto"]')" HTTP/1.1 'protocol'
+assert_eq "$(seen /order '.["torii-connection-requests"]')" 1 'first request of its connection'
 assert_eq "$(seen /order '.["torii-tls"]')" null 'no TLS data without TLS, whatever the client claims'
 many=()
 for i in $(seq 70); do many+=(-H "X-H$i: 1"); done
@@ -567,6 +568,7 @@ if (( HAVE_SSL )); then
         || fail 'transport error: TLS keepalive'
     assert_contains ",$(tls /keep1 3)," ',0304,' 'TLS supported versions'
     assert_eq "$(seen /keep2 '.["torii-tls"]')" "$(seen /keep1 '.["torii-tls"]')" 'TLS data on a kept connection'
+    assert_eq "$(seen /keep2 '.["torii-connection-requests"]')" 2 'second request of a kept connection'
 
     if curl --version | grep -q HTTP2; then
         tcurl --http2 -o /dev/null -A h2-test -H 'X-b: 1' -H 'x-A: 2' "https://torii.test:$P_TLS/h2" \

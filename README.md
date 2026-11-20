@@ -161,6 +161,7 @@ header of one of these names that the client sent itself never reaches Torii.
 | `Torii-Proto` | `HTTP/1.1`, `HTTP/2.0`, `HTTP/3.0` |
 | `Torii-Header-Order` | `$torii_header_order` |
 | `Torii-TLS` | `$torii_tls` |
+| `Torii-Connection-Requests` | `$connection_requests`: the number of this request among those of its connection, 1 for the first |
 
 `$torii_header_order` is the names of the request headers, separated by commas, in the order
 and the case the client sent them: `Host,User-Agent,Accept,Accept-Encoding`. At most 64 names
@@ -229,7 +230,7 @@ takes its place, or loses its own.
 
 Request headers sent to Torii (see `conf/torii_params.conf`): `Torii-Site`,
 `Torii-Client-IP`, `Torii-Host`, `Torii-URI`, `Torii-Method`, `Torii-Features`,
-`Torii-Scheme`, `Torii-Proto`, `Torii-Header-Order`, `Torii-TLS`, plus the headers of the
+`Torii-Scheme`, `Torii-Proto`, `Torii-Header-Order`, `Torii-TLS`, `Torii-Connection-Requests`, plus the headers of the
 client request.
 
 Response of `/v1/check`:
