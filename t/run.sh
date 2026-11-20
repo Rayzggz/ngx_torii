@@ -669,6 +669,7 @@ assert_eq "$(report 1 .ustatus)" 200 'report upstream status'
 assert_eq "$(report 1 .conn_reqs)" 1 'report connection request count'
 assert_eq "$(report 1 .bytes)" "$(wc -c < "$RUN/b" | tr -d ' ')" 'report body size'
 assert_eq "$(report 1 '(.rt >= 0) and (.urt >= 0) and (.req_len > 0)')" true 'report timings and request size'
+assert_eq "$(report 1 '(.uct >= 0) and (.uht >= .uct) and (.urt >= .uht)')" true 'report upstream connect and header times'
 assert_eq "$(report 1 "((.ts / 1000) - $(date +%s)) | fabs < 60")" true 'report timestamp'
 
 # A request Torii answered itself: no upstream was involved.

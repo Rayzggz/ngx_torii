@@ -753,7 +753,7 @@ ngx_http_torii_report(ngx_http_request_t *r, ngx_http_torii_loc_conf_t *tlcf,
     ngx_uint_t                  i, j, n, status, ustatus;
     ngx_time_t                 *tp;
     ngx_list_part_t            *part;
-    ngx_msec_int_t              rt, urt;
+    ngx_msec_int_t              rt, urt, uct, uht;
     ngx_table_elt_t            *h, *fetches[3], *lang;
     ngx_http_variable_value_t  *vv;
     ngx_http_upstream_state_t  *state;
@@ -917,8 +917,9 @@ ngx_http_torii_report(ngx_http_request_t *r, ngx_http_torii_loc_conf_t *tlcf,
                          NGX_HTTP_TORII_REPORT_SHORT_MAX);
 
     size = sizeof("{\"v\":1,\"ts\":,\"status\":,\"conn_reqs\":,\"lang\":true"
-                  ",\"rt\":,\"urt\":,\"ustatus\":,\"bytes\":,\"req_len\":}")
-           + 2 * NGX_TIME_T_LEN + 6 * NGX_INT_T_LEN + 2 * NGX_OFF_T_LEN;
+                  ",\"rt\":,\"urt\":,\"uct\":,\"uht\":,\"ustatus\":,\"bytes\":"
+                  ",\"req_len\":}")
+           + 2 * NGX_TIME_T_LEN + 8 * NGX_INT_T_LEN + 2 * NGX_OFF_T_LEN;
 
     for (i = 0; i < n; i++) {
         if (fields[i].value.len) {
@@ -987,6 +988,19 @@ ngx_http_torii_report(ngx_http_request_t *r, ngx_http_torii_loc_conf_t *tlcf,
 
         if (urt >= 0) {
             p = ngx_sprintf(p, ",\"urt\":%i", (ngx_int_t) urt);
+        }
+
+        /* both stay -1 when the upstream was not reached, or sent no header */
+
+        uct = (ngx_msec_int_t) state->connect_time;
+        uht = (ngx_msec_int_t) state->header_time;
+
+        if (uct >= 0) {
+            p = ngx_sprintf(p, ",\"uct\":%i", (ngx_int_t) uct);
+        }
+
+        if (uht >= 0) {
+            p = ngx_sprintf(p, ",\"uht\":%i", (ngx_int_t) uht);
         }
 
         if (ustatus) {

@@ -108,6 +108,7 @@ A report is one datagram holding one JSON object. Empty and zero fields are left
 | `fetch`, `lang` | `Sec-Fetch-Dest/Mode/Site` joined by `/`; whether `Accept-Language` was sent |
 | `ctype` | `Content-Type` of the response |
 | `rt`, `urt`, `ustatus`, `cache` | Time to serve and upstream time in milliseconds, upstream status, cache status |
+| `uct`, `uht` | Time it took to connect to the upstream, and until the upstream had sent its response header, in milliseconds |
 | `bytes`, `req_len` | Response body size sent, request size |
 
 Cookies, `Authorization`, other headers and bodies are never sent. `uri` is cut at 2048 bytes,
